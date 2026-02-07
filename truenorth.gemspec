@@ -2,9 +2,9 @@
 
 Gem::Specification.new do |spec|
   spec.name          = 'truenorth'
-  spec.version       = '0.1.0'
+  spec.version       = '0.2.8'
   spec.authors       = ['usiegj00']
-  spec.email         = ['gems@eisenbergeffect.com']
+  spec.email         = ['112138+usiegj00@users.noreply.github.com']
 
   spec.summary       = 'CLI client for NorthStar facility booking systems'
   spec.description   = 'A command-line interface for checking availability, managing bookings, ' \
@@ -30,6 +30,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency 'base64', '~> 0.2'
   spec.add_dependency 'nokogiri', '~> 1.15'
   spec.add_dependency 'thor', '~> 1.3'
+  spec.add_dependency 'tty-table', '~> 0.12'
 
   spec.add_development_dependency 'bundler', '~> 2.0'
   spec.add_development_dependency 'rake', '~> 13.0'

@@ -5,6 +5,7 @@ require 'uri'
 require 'nokogiri'
 require 'json'
 require 'base64'
+require 'date'
 
 module Truenorth
   # HTTP client for NorthStar facility booking systems
@@ -212,35 +213,189 @@ module Truenorth
       html = Nokogiri::HTML(response.body)
 
       reservations = []
-      html.css('.reservation-item, .res-item, tr.reservation').each do |item|
-        reservation = parse_reservation(item)
-        reservations << reservation if reservation
-      end
 
-      # Alternative: look for table rows with reservation data
-      if reservations.empty?
-        html.css('table tbody tr').each do |row|
+      # Remove script tags to avoid JavaScript in text extraction
+      html.css('script').remove
+
+      # Reservations are grouped by member in dt.ui-datalist-item elements
+      html.css('dt.ui-datalist-item').each_with_index do |member_section, member_idx|
+        # Extract member name from the header
+        # Format: "Siegel, Jonathan's Reservations (50)" or "My Reservations(5)"
+        header_text = member_section.text.gsub(/\s+/, ' ').strip
+        member_match = header_text.match(/^(.+?)'s Reservations/)
+        member_name = if member_match
+                        member_match[1].strip
+                      elsif header_text.start_with?('My Reservations')
+                        nil  # nil means it's the logged-in user
+                      end
+
+        # Now find all tables within this member section
+        member_section.css('table tbody tr').each_with_index do |row, row_idx|
           cells = row.css('td')
-          next if cells.length < 3
+          next if cells.length < 2
 
-          reservations << {
-            date: cells[0]&.text&.strip,
-            time: cells[1]&.text&.strip,
-            activity: cells[2]&.text&.strip,
-            court: cells[3]&.text&.strip,
-            status: cells[4]&.text&.strip
-          }
+          # Extract text and clean it
+          text_parts = cells.map { |cell| clean_cell_text(cell) }
+          next if text_parts.all?(&:empty?)
+
+          # Find the cancel button link (title="Cancel Reservation")
+          cancel_link = row.at_css('a[title="Cancel Reservation"]')
+          cancel_id = cancel_link['id'] if cancel_link
+
+          # Parse the reservation data
+          reservation = parse_reservation_row(text_parts)
+          if reservation && reservation[:date]
+            reservation[:member] = member_name
+            reservation[:member_idx] = member_idx
+            reservation[:row_idx] = row_idx
+            reservation[:cancel_id] = cancel_id
+            reservations << reservation
+          end
         end
       end
 
       log "Found #{reservations.count} reservations"
+
+      # Sort by date
+      reservations.sort_by! do |res|
+        Date.strptime(res[:date], '%m/%d/%Y') rescue Date.today
+      end
+
       reservations
     end
 
     # Cancel a reservation
+    # reservation_id is the cancel button ID from the reservation
     def cancel(reservation_id, dry_run: false)
       ensure_logged_in!
-      raise BookingError, 'Cancel not yet implemented'
+
+      log "\n=== CANCEL RESERVATION ==="
+      log "Cancel ID: #{reservation_id}"
+      log 'DRY RUN MODE' if dry_run
+
+      return { success: true, dry_run: true, message: 'Dry run - would cancel reservation' } if dry_run
+
+      # Get the reservations page to extract form state
+      response = get(RESERVATIONS_PATH)
+      html = Nokogiri::HTML(response.body)
+
+      view_state = extract_view_state(html)
+      form_id = '_memberReservations_WAR_northstarportlet_:reservationsForm'
+
+      raise BookingError, 'Could not extract view state' unless view_state
+
+      # Step 1: Click the cancel button to open the confirmation dialog
+      # The dialog button will be enabled in the AJAX response
+      ajax_url = "#{@base_url}#{RESERVATIONS_PATH}?p_p_id=memberReservations_WAR_northstarportlet" \
+                 '&p_p_lifecycle=2&p_p_state=normal&p_p_mode=view' \
+                 '&p_p_cacheability=cacheLevelPage' \
+                 '&_memberReservations_WAR_northstarportlet__jsfBridgeAjax=true'
+
+      form_data = {
+        'javax.faces.partial.ajax' => 'true',
+        'javax.faces.source' => reservation_id,
+        'javax.faces.partial.execute' => '@all',
+        'javax.faces.partial.render' => form_id,
+        form_id => form_id,
+        'javax.faces.ViewState' => view_state,
+        reservation_id => reservation_id
+      }
+
+      response = post_ajax(ajax_url, form_data)
+
+      unless response.is_a?(Net::HTTPSuccess)
+        return { success: false, error: "HTTP #{response.code}" }
+      end
+
+      body = response.body
+      log "Step 1 response length: #{body.length}"
+
+      # Check if a confirmation dialog was opened
+      if body.include?("PF('cancelReservationDialog').show()") || body.include?('.show()')
+        log "Confirmation dialog opened"
+
+        # Extract the updated ViewState from the AJAX response
+        new_view_state = extract_view_state_from_ajax(body) || view_state
+
+        # Parse the AJAX response to find the enabled YES button
+        response_html = Nokogiri::HTML(body)
+
+        # Look for the YES button in the dialog (not in the reservation list!)
+        # The YES button has specific characteristics:
+        # 1. Contains text "YES"
+        # 2. Has class "ui-area-btn-danger"
+        # 3. Is inside the cancel dialog (j_idt274)
+        confirm_button = response_html.css('div[id*="j_idt274"] a.ui-area-btn-danger').find do |link|
+          link.text.strip.upcase.include?('YES')
+        end
+
+        # Fallback: look for any YES button with the right classes
+        unless confirm_button
+          confirm_button = response_html.css('a.ui-commandlink').find do |link|
+            link_text = link.text.strip.upcase
+            link_class = link['class'].to_s
+            link_text == 'YES' && link_class.include?('ui-area-btn-danger') &&
+              !link_class.include?('disabled')
+          end
+        end
+
+        unless confirm_button
+          log "Could not find enabled YES button in response"
+          log "Response preview: #{body[0..2000]}"
+          return { success: false, error: 'Could not find confirmation button' }
+        end
+
+        confirm_button_id = confirm_button['id']
+        log "Found confirmation button in response: #{confirm_button_id}"
+
+        # Step 2: Click the "Yes" button to actually cancel
+        confirm_data = {
+          'javax.faces.partial.ajax' => 'true',
+          'javax.faces.source' => confirm_button_id,
+          'javax.faces.partial.execute' => '@all',
+          'javax.faces.partial.render' => form_id,
+          form_id => form_id,
+          'javax.faces.ViewState' => new_view_state,
+          confirm_button_id => confirm_button_id
+        }
+
+        log "Clicking confirmation button: #{confirm_button_id}"
+        confirm_response = post_ajax(ajax_url, confirm_data)
+
+        if confirm_response.is_a?(Net::HTTPSuccess)
+          confirm_body = confirm_response.body
+          log "Step 2 response length: #{confirm_body.length}"
+          log "Step 2 response preview: #{confirm_body[0..500]}"
+
+          # Check for success indicators
+          if confirm_body =~ /cancelled.*successfully/i ||
+             confirm_body =~ /reservation.*cancelled/i ||
+             confirm_body =~ /successfully.*cancelled/i ||
+             confirm_body.include?('growl') ||
+             confirm_body.length < 1000
+            log 'Cancellation confirmed successfully'
+            { success: true, message: 'Reservation cancelled' }
+          else
+            log "Warning: Uncertain confirmation response"
+            { success: true, message: 'Cancellation likely succeeded (please verify)' }
+          end
+        else
+          { success: false, error: "Confirmation failed: HTTP #{confirm_response.code}" }
+        end
+      else
+        # No dialog - check if it was directly cancelled
+        log "No confirmation dialog detected"
+
+        if body =~ /cancelled.*successfully/i ||
+           body =~ /reservation.*cancelled/i ||
+           body.length < 500
+          log 'Direct cancellation successful'
+          { success: true, message: 'Reservation cancelled' }
+        else
+          log "Uncertain result (#{body.length} bytes)"
+          { success: false, error: 'Uncertain if cancellation succeeded - please verify' }
+        end
+      end
     end
 
     private
@@ -300,16 +455,81 @@ module Truenorth
       time_str.strip.gsub(/^0/, '').upcase
     end
 
-    def parse_reservation(item)
-      # Try various selectors for reservation details
-      date = item.at_css('.date, .res-date')&.text&.strip
-      time = item.at_css('.time, .res-time')&.text&.strip
-      court = item.at_css('.court, .location, .res-location')&.text&.strip
-      activity = item.at_css('.activity, .res-activity')&.text&.strip
+    def clean_cell_text(cell)
+      # Remove script tags first
+      cell_copy = cell.dup
+      cell_copy.css('script').remove
 
-      return nil unless date || time
+      # Get text and clean it
+      text = cell_copy.text
 
-      { date: date, time: time, court: court, activity: activity }
+      # Remove JavaScript function calls and parameters
+      text = text.gsub(/\$\(function\(\)\{.*?\}\);?/m, '')
+      text = text.gsub(/PrimeFaces\.cw\([^)]+\);?/m, '')
+
+      # Clean up whitespace
+      text = text.gsub(/\s+/, ' ').strip
+
+      text
+    end
+
+    def parse_reservation_row(text_parts)
+      # The format is:
+      # Cell 0: "Event scheduled On Dates:..."
+      # Cell 1: "Activities (Court 2 | Squash) MM/DD/YYYY HH:MM AM - HH:MM AM"
+      # Cell 2: Date
+
+      return nil if text_parts.length < 2
+
+      # Parse cell 1 which has the activity and time info
+      cell1 = text_parts[1]
+
+      # Extract activity/event type and details
+      # Format: "Activities (Court 2 | Squash)" or "Events (Event Name (time) | Category)"
+      # Use a greedy match that stops before the date pattern
+      activity_match = cell1.match(/(Activities|Events)\s+\((.+?)\)\s*\d{2}\/\d{2}\/\d{4}/)
+      activity = nil
+      court = nil
+
+      if activity_match
+        activity_full = activity_match[2]
+        # Parse "Court 2 | Squash" or "Event Name | Category"
+        if activity_full.include?('|')
+          parts = activity_full.split('|').map(&:strip)
+          if parts[0] =~ /Court|Training|Room/
+            court = parts[0]
+            activity = parts[1]
+          else
+            activity = parts[0]
+            court = parts[1] if parts[1]
+          end
+        else
+          activity = activity_full
+        end
+      end
+
+      # Extract dates in MM/DD/YYYY format from cell1
+      dates = cell1.scan(/\b(\d{2}\/\d{2}\/\d{4})\b/).flatten
+
+      # Extract times in HH:MM AM/PM format from cell1
+      times = cell1.scan(/(\d{1,2}:\d{2}\s+[AP]M)/).flatten
+
+      return nil if dates.empty?
+
+      # Take the first date and construct time range
+      date = dates.first
+      time = if times.length >= 2
+               "#{times[0]} - #{times[1]}"
+             elsif times.length == 1
+               times[0]
+             end
+
+      {
+        date: date,
+        time: time,
+        activity: activity,
+        court: court
+      }
     end
 
     def change_activity(html, activity_id)
