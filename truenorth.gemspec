@@ -2,7 +2,7 @@
 
 Gem::Specification.new do |spec|
   spec.name          = 'truenorth'
-  spec.version       = '0.2.8'
+  spec.version       = '0.2.9'
   spec.authors       = ['usiegj00']
   spec.email         = ['112138+usiegj00@users.noreply.github.com']
 

@@ -119,7 +119,14 @@ module Truenorth
         html = change_activity(html, activity_id)
       end
 
-      # TODO: Handle date navigation if needed
+      # Navigate to the requested date if needed
+      current_date = html.at_css('input[name*="sheetDate"]')&.[]('value')
+      requested_date = date.strftime('%m/%d/%Y')
+
+      if current_date != requested_date
+        log "Navigating from #{current_date} to #{requested_date}"
+        html = change_date(html, requested_date)
+      end
 
       slots = parse_slots(html)
       log "Found #{slots.count} available time slots"
@@ -409,10 +416,22 @@ module Truenorth
     def parse_slots(html)
       slots = {}
 
-      html.css('td.slot.open').each do |td|
-        div = td.at_css('div[data-start-time]')
-        next unless div
-        next if td['class']&.include?('reserved')
+      # Find all slots with data-start-time (these are bookable slots)
+      html.css('td.slot div[data-start-time]').each do |div|
+        td = div.parent
+        while td && td.name != 'td'
+          td = td.parent
+        end
+        next unless td
+
+        # Skip if slot is reserved, restricted, or blocked
+        classes = td['class'].to_s
+        next if classes.include?('reserved')
+        next if classes.include?('restrict')
+        next if classes.include?('blocked')
+
+        # Only include open slots (or past-time open slots for debugging)
+        next unless classes.include?('open')
 
         start_time = div['data-start-time']
         area_id = div['data-area-id']
@@ -544,6 +563,20 @@ module Truenorth
       Nokogiri::HTML(result[:body])
     end
 
+    def change_date(html, date_str)
+      form_id = extract_form_id(html)
+      view_state = extract_view_state(html)
+      form_fields = extract_all_form_fields(html, form_id)
+
+      result = change_date_ajax(form_id, view_state, date_str, form_fields)
+      return html unless result[:success]
+
+      # The AJAX response may not include the full updated page
+      # So fetch the page again to get the updated slots
+      response = get(BOOKING_PATH)
+      Nokogiri::HTML(response.body)
+    end
+
     def extract_view_state(html)
       html.at_css('input[name="javax.faces.ViewState"]')&.[]('value')
     end
@@ -616,6 +649,34 @@ module Truenorth
         'javax.faces.partial.render' => form_id,
         'javax.faces.behavior.event' => 'change',
         'javax.faces.partial.event' => 'change',
+        form_id => form_id,
+        'javax.faces.encodedURL' => encoded_url,
+        'javax.faces.ViewState' => view_state
+      )
+
+      response = post_ajax(ajax_url, form_data)
+      if response.is_a?(Net::HTTPSuccess)
+        { success: true, view_state: extract_view_state_from_ajax(response.body), body: response.body }
+      else
+        { success: false, error: "HTTP #{response.code}" }
+      end
+    end
+
+    def change_date_ajax(form_id, view_state, date_str, form_fields)
+      date_picker = "#{form_id}:j_idt57"
+      ajax_url = build_ajax_url
+      encoded_url = URI.encode_www_form_component(ajax_url)
+
+      form_data = form_fields.dup
+      form_data["#{form_id}:sheetDate"] = date_str
+      form_data["#{form_id}:j_idt57_input"] = date_str
+      form_data.merge!(
+        'javax.faces.partial.ajax' => 'true',
+        'javax.faces.source' => date_picker,
+        'javax.faces.partial.execute' => date_picker,
+        'javax.faces.partial.render' => form_id,  # Update whole form, not just slots
+        'javax.faces.behavior.event' => 'dateSelect',
+        'javax.faces.partial.event' => 'dateSelect',
         form_id => form_id,
         'javax.faces.encodedURL' => encoded_url,
         'javax.faces.ViewState' => view_state
