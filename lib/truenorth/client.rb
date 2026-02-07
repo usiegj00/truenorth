@@ -110,22 +110,22 @@ module Truenorth
       response = get(BOOKING_PATH)
       html = Nokogiri::HTML(response.body)
 
-      # Check if we need to change activity type first
-      activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
-      current_activity = html.at_css('input[name*="activityId"]')&.[]('value')
-
-      if current_activity && current_activity != activity_id
-        # Need to change activity via AJAX
-        html = change_activity(html, activity_id)
-      end
-
-      # Navigate to the requested date if needed
+      # Navigate to the requested date first if needed
       current_date = html.at_css('input[name*="sheetDate"]')&.[]('value')
       requested_date = date.strftime('%m/%d/%Y')
+      activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
 
       if current_date != requested_date
         log "Navigating from #{current_date} to #{requested_date}"
         html = change_date(html, requested_date, activity_id)
+      end
+
+      # Then change activity type - this should now return slots for the correct date
+      current_activity = html.at_css('input[name*="activityId"]')&.[]('value')
+
+      if current_activity && current_activity != activity_id
+        log "Changing activity from #{current_activity} to #{activity_id}"
+        html = change_activity(html, activity_id)
       end
 
       slots = parse_slots(html)
@@ -138,6 +138,7 @@ module Truenorth
         slots: slots
       }
     end
+
 
     # Book a slot
     def book(time, date: Date.today, court: nil, activity: 'squash', dry_run: false)
@@ -416,7 +417,7 @@ module Truenorth
     def parse_slots(html)
       slots = {}
 
-      # Find all slots with data-start-time (these are bookable slots)
+      # Find ALL slots with data-start-time
       html.css('td.slot div[data-start-time]').each do |div|
         td = div.parent
         while td && td.name != 'td'
@@ -424,21 +425,50 @@ module Truenorth
         end
         next unless td
 
-        # Skip if slot is reserved, restricted, or blocked
         classes = td['class'].to_s
+
+        # Skip definitively unavailable slots
         next if classes.include?('reserved')
         next if classes.include?('restrict')
         next if classes.include?('blocked')
 
-        # Only include open slots (or past-time open slots for debugging)
-        next unless classes.include?('open')
+        # Include ANY slot that's marked as "open", even if it has past-time
+        # The website shows past-time slots for future dates as bookable
+        if classes.include?('open')
+          start_time = div['data-start-time']
+          area_id = div['data-area-id']
+          court_name = COURTS[area_id] || "Court #{area_id}"
 
-        start_time = div['data-start-time']
-        area_id = div['data-area-id']
-        court_name = COURTS[area_id] || "Court #{area_id}"
+          slots[start_time] ||= []
+          slots[start_time] << court_name unless slots[start_time].include?(court_name)
+        end
+      end
 
-        slots[start_time] ||= []
-        slots[start_time] << court_name
+      # If we found very few slots, be more aggressive
+      if slots.length < 10
+        log "Found only #{slots.length} slots with strict parsing, trying relaxed parsing..."
+
+        # Try including ALL non-reserved slots
+        html.css('td.slot div[data-start-time]').each do |div|
+          td = div.parent
+          while td && td.name != 'td'
+            td = td.parent
+          end
+          next unless td
+
+          classes = td['class'].to_s
+          # Only skip if explicitly reserved/restricted/blocked
+          next if classes.include?('reserved') && !classes.include?('open')
+          next if classes.include?('restrict')
+          next if classes.include?('blocked')
+
+          start_time = div['data-start-time']
+          area_id = div['data-area-id']
+          court_name = COURTS[area_id] || "Court #{area_id}"
+
+          slots[start_time] ||= []
+          slots[start_time] << court_name unless slots[start_time].include?(court_name)
+        end
       end
 
       slots
@@ -564,55 +594,55 @@ module Truenorth
     end
 
     def change_date(html, date_str, activity_id = nil)
+      # Extract what we can from the HTML
       form_id = extract_form_id(html)
       view_state = extract_view_state(html)
 
-      # Extract form fields from current HTML
-      form_fields = extract_all_form_fields(html, form_id)
+      # Build minimal form data manually to avoid extraction issues
+      form_data = build_minimal_form_data(html, form_id, activity_id)
 
-      # CRITICAL FIX: The activityId field in the HTML might not be updated
-      # after change_activity, so we need to manually set it
-      if activity_id
-        form_fields["#{form_id}:activityId"] = activity_id
-        form_fields["#{form_id}:j_idt51_input"] = activity_id
-        log "Forcing activityId to #{activity_id} for date change"
-      end
-
-      # Ensure we have form fields
-      if form_fields.nil? || form_fields.empty?
-        log "Warning: Form fields empty, re-extracting from HTML"
-        form = html.at_css("form[id='#{form_id}']")
-        if form
-          form_fields = {}
-          form.css('input, select').each do |field|
-            name = field['name']
-            value = field['value']
-            form_fields[name] = value || '' if name
-          end
-          # Re-apply activity ID
-          if activity_id
-            form_fields["#{form_id}:activityId"] = activity_id
-            form_fields["#{form_id}:j_idt51_input"] = activity_id
-          end
-        else
-          form_fields = {}
-        end
-      end
-
-      result = change_date_ajax(form_id, view_state, date_str, form_fields)
+      result = change_date_ajax(form_id, view_state, date_str, form_data)
       return html unless result[:success]
 
-      # Parse the AJAX response - it should contain the updated form in CDATA
+      # Parse the AJAX response
       ajax_body = result[:body]
       cdata_content = ajax_body.scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
 
       if !cdata_content.empty? && cdata_content.include?('slot')
-        # We got updated slot data, parse it
         Nokogiri::HTML(cdata_content)
       else
-        log "Date change didn't return slot data, keeping original HTML"
         html
       end
+    end
+
+    def build_minimal_form_data(html, form_id, activity_id)
+      # Build the minimum required form data from scratch
+      # Only extract the fields we absolutely need
+      data = {}
+
+      # Try to find the form
+      form = html.at_css("form[id='#{form_id}']")
+      return data unless form
+
+      # Extract only the essential hidden fields
+      form.css('input[type="hidden"]').each do |input|
+        name = input['name']
+        value = input['value']
+        next unless name
+
+        # Only keep fields that belong to our form
+        if name.to_s.start_with?(form_id)
+          data[name] = value || ''
+        end
+      end
+
+      # Override activity ID if provided
+      if activity_id
+        data["#{form_id}:activityId"] = activity_id.to_s
+        data["#{form_id}:j_idt51_input"] = activity_id.to_s
+      end
+
+      data
     end
 
     def extract_view_state(html)
@@ -700,32 +730,19 @@ module Truenorth
       end
     end
 
-    def change_date_ajax(form_id, view_state, date_str, form_fields)
+    def change_date_ajax(form_id, view_state, date_str, form_data)
+      return { success: false, error: 'No form_id' } unless form_id
+
       date_picker = "#{form_id}:j_idt57"
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
-      # Build form_data carefully, ensuring all field names are properly prefixed
-      form_data = {}
-
-      # Copy form fields, ensuring keys are strings with proper prefixes
-      form_fields.each do |key, value|
-        # Skip nil keys and ensure proper format
-        next if key.nil?
-        key_str = key.to_s
-        # Ensure key has form_id prefix (if form_id is set)
-        if form_id && (!key_str.include?(':') || !key_str.start_with?(form_id))
-          # Skip malformed keys
-          next
-        end
-        form_data[key_str] = value
-      end
-
-      # Override with our date values
+      # Use form_data as-is (already built correctly by build_minimal_form_data)
+      # Just add our date values and AJAX control parameters
+      form_data = form_data.dup
       form_data["#{form_id}:sheetDate"] = date_str
       form_data["#{form_id}:j_idt57_input"] = date_str
 
-      # Add AJAX control parameters
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
         'javax.faces.source' => date_picker,
