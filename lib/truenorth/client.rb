@@ -125,7 +125,7 @@ module Truenorth
 
       if current_date != requested_date
         log "Navigating from #{current_date} to #{requested_date}"
-        html = change_date(html, requested_date)
+        html = change_date(html, requested_date, activity_id)
       end
 
       slots = parse_slots(html)
@@ -563,18 +563,56 @@ module Truenorth
       Nokogiri::HTML(result[:body])
     end
 
-    def change_date(html, date_str)
+    def change_date(html, date_str, activity_id = nil)
       form_id = extract_form_id(html)
       view_state = extract_view_state(html)
+
+      # Extract form fields from current HTML
       form_fields = extract_all_form_fields(html, form_id)
+
+      # CRITICAL FIX: The activityId field in the HTML might not be updated
+      # after change_activity, so we need to manually set it
+      if activity_id
+        form_fields["#{form_id}:activityId"] = activity_id
+        form_fields["#{form_id}:j_idt51_input"] = activity_id
+        log "Forcing activityId to #{activity_id} for date change"
+      end
+
+      # Ensure we have form fields
+      if form_fields.nil? || form_fields.empty?
+        log "Warning: Form fields empty, re-extracting from HTML"
+        form = html.at_css("form[id='#{form_id}']")
+        if form
+          form_fields = {}
+          form.css('input, select').each do |field|
+            name = field['name']
+            value = field['value']
+            form_fields[name] = value || '' if name
+          end
+          # Re-apply activity ID
+          if activity_id
+            form_fields["#{form_id}:activityId"] = activity_id
+            form_fields["#{form_id}:j_idt51_input"] = activity_id
+          end
+        else
+          form_fields = {}
+        end
+      end
 
       result = change_date_ajax(form_id, view_state, date_str, form_fields)
       return html unless result[:success]
 
-      # The AJAX response may not include the full updated page
-      # So fetch the page again to get the updated slots
-      response = get(BOOKING_PATH)
-      Nokogiri::HTML(response.body)
+      # Parse the AJAX response - it should contain the updated form in CDATA
+      ajax_body = result[:body]
+      cdata_content = ajax_body.scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
+
+      if !cdata_content.empty? && cdata_content.include?('slot')
+        # We got updated slot data, parse it
+        Nokogiri::HTML(cdata_content)
+      else
+        log "Date change didn't return slot data, keeping original HTML"
+        html
+      end
     end
 
     def extract_view_state(html)
@@ -667,14 +705,32 @@ module Truenorth
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
-      form_data = form_fields.dup
+      # Build form_data carefully, ensuring all field names are properly prefixed
+      form_data = {}
+
+      # Copy form fields, ensuring keys are strings with proper prefixes
+      form_fields.each do |key, value|
+        # Skip nil keys and ensure proper format
+        next if key.nil?
+        key_str = key.to_s
+        # Ensure key has form_id prefix (if form_id is set)
+        if form_id && (!key_str.include?(':') || !key_str.start_with?(form_id))
+          # Skip malformed keys
+          next
+        end
+        form_data[key_str] = value
+      end
+
+      # Override with our date values
       form_data["#{form_id}:sheetDate"] = date_str
       form_data["#{form_id}:j_idt57_input"] = date_str
+
+      # Add AJAX control parameters
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
         'javax.faces.source' => date_picker,
         'javax.faces.partial.execute' => date_picker,
-        'javax.faces.partial.render' => form_id,  # Update whole form, not just slots
+        'javax.faces.partial.render' => form_id,
         'javax.faces.behavior.event' => 'dateSelect',
         'javax.faces.partial.event' => 'dateSelect',
         form_id => form_id,
