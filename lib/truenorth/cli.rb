@@ -12,6 +12,9 @@ module Truenorth
       true
     end
 
+    # Handle --version flag
+    map %w[--version -v] => :version
+
     desc 'configure', 'Set up credentials for the booking system'
     option :username, aliases: '-u', desc: 'Member ID (e.g., 12345-00)'
     option :password, aliases: '-p', desc: 'Password'
