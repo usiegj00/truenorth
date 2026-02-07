@@ -35,9 +35,17 @@ module Truenorth
     desc 'availability [DATE]', 'Check available slots'
     option :activity, aliases: '-a', default: 'squash', desc: 'Activity type (squash, golf, music, meeting)'
     option :json, type: :boolean, desc: 'Output as JSON'
+    option :debug, type: :boolean, desc: 'Show debug output'
+    option :http, type: :boolean, desc: 'Use HTTP mode (faster, but only 2 courts)'
     def availability(date = nil)
       date = parse_date(date)
-      client = Client.new
+
+      client = if options[:http]
+                 say 'Using HTTP mode (fast, 2 courts only)...', :yellow if !options[:json]
+                 Client.new(debug: options[:debug])
+               else
+                 BrowserClient.new(debug: options[:debug])
+               end
 
       say "Checking availability for #{date}...", :cyan
       result = client.availability(date, activity: options[:activity])
@@ -64,6 +72,8 @@ module Truenorth
     option :court, aliases: '-c', desc: 'Preferred court (e.g., "Court 1", "Squash Court 2")'
     option :activity, aliases: '-a', default: 'squash', desc: 'Activity type'
     option :dry_run, type: :boolean, aliases: '-n', desc: 'Test without actually booking'
+    option :http, type: :boolean, desc: 'Use HTTP mode (faster, but only 2 courts)'
+    option :debug, type: :boolean, desc: 'Show debug output'
     def book(time_or_description)
       # Parse natural language input
       parsed = parse_booking_request(time_or_description, options[:date], options[:activity])
@@ -71,7 +81,13 @@ module Truenorth
       date = parsed[:date]
       time = parsed[:time]
       activity = parsed[:activity]
-      client = Client.new
+
+      # Use browser mode unless --http flag is set (needed to see all 3 courts)
+      client = if options[:http]
+                 Client.new(debug: options[:debug])
+               else
+                 BrowserClient.new(debug: options[:debug])
+               end
 
       mode = options[:dry_run] ? ' (DRY RUN)' : ''
       say "Booking #{activity} at #{time} on #{date}#{mode}...", :cyan
@@ -109,8 +125,10 @@ module Truenorth
     desc 'reservations', 'List your current reservations'
     option :json, type: :boolean, desc: 'Output as JSON'
     option :all, type: :boolean, aliases: '-a', desc: 'Show all family members (default: only you)'
+    option :debug, type: :boolean, desc: 'Show debug output'
     def reservations
-      client = Client.new
+      # Use HTTP mode for reservations (works reliably)
+      client = Client.new(debug: options[:debug])
 
       say 'Fetching reservations...', :cyan
       results = client.reservations
@@ -153,6 +171,7 @@ module Truenorth
     option :all, type: :boolean, aliases: '-a', desc: 'Cancel from full list (use with --all view)'
     option :debug, type: :boolean, desc: 'Show debug output'
     def cancel(index)
+      # Use HTTP mode for cancellation (works reliably)
       client = Client.new(debug: options[:debug])
 
       say 'Fetching reservations...', :cyan

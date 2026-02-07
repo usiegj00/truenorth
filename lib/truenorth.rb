@@ -2,6 +2,7 @@
 
 require_relative 'truenorth/version'
 require_relative 'truenorth/client'
+require_relative 'truenorth/browser_client'
 require_relative 'truenorth/config'
 
 module Truenorth

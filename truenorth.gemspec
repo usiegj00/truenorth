@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
+require_relative 'lib/truenorth/version'
+
 Gem::Specification.new do |spec|
   spec.name          = 'truenorth'
-  spec.version       = '0.3.0'
+  spec.version       = Truenorth::VERSION
   spec.authors       = ['usiegj00']
   spec.email         = ['112138+usiegj00@users.noreply.github.com']
 
@@ -28,6 +30,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ['lib']
 
   spec.add_dependency 'base64', '~> 0.2'
+  spec.add_dependency 'ferrum', '~> 0.15'
   spec.add_dependency 'nokogiri', '~> 1.15'
   spec.add_dependency 'thor', '~> 1.3'
   spec.add_dependency 'tty-table', '~> 0.12'

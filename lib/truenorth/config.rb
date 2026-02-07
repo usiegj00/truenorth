@@ -8,6 +8,7 @@ module Truenorth
     CONFIG_DIR = File.expand_path('~/.config/truenorth')
     CONFIG_FILE = File.join(CONFIG_DIR, 'config.yml')
     CREDENTIALS_FILE = File.join(CONFIG_DIR, 'credentials.yml')
+    COOKIES_FILE = File.join(CONFIG_DIR, 'cookies.yml')
 
     class << self
       def load
@@ -62,7 +63,41 @@ module Truenorth
         CONFIG_DIR
       end
 
+      def cookies
+        load_cookies
+      end
+
+      def save_cookies(cookies_hash)
+        FileUtils.mkdir_p(CONFIG_DIR)
+        File.write(COOKIES_FILE, YAML.dump({
+          'cookies' => cookies_hash,
+          'timestamp' => Time.now.to_i
+        }))
+        FileUtils.chmod(0o600, COOKIES_FILE)
+      end
+
+      def clear_cookies
+        File.delete(COOKIES_FILE) if File.exist?(COOKIES_FILE)
+      end
+
       private
+
+      def load_cookies
+        return {} unless File.exist?(COOKIES_FILE)
+
+        data = YAML.safe_load(File.read(COOKIES_FILE)) || {}
+        timestamp = data['timestamp']
+
+        # Cookies expire after 24 hours
+        if timestamp && (Time.now.to_i - timestamp) < 86400
+          data['cookies'] || {}
+        else
+          clear_cookies
+          {}
+        end
+      rescue StandardError
+        {}
+      end
 
       def load_config
         return {} unless File.exist?(CONFIG_FILE)

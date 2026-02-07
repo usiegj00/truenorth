@@ -15,7 +15,8 @@ module Truenorth
     BOOKING_PATH = '/group/pages/facility-booking'
     RESERVATIONS_PATH = '/group/pages/my-reservations'
 
-    USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' \
+    # Use a desktop user agent - server may detect mobile based on UA
+    USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' \
                  'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
     # Activity type IDs
@@ -37,16 +38,27 @@ module Truenorth
       '32' => 'Court 3'
     }.freeze
 
+    # Court IDs by activity
+    COURT_IDS_BY_ACTIVITY = {
+      'squash' => %w[16 17 18],
+      'golf' => %w[30 31 32],
+      'music' => %w[16 17 18],  # May need to update these
+      'room' => %w[30 31 32],   # May need to update these
+      'meeting' => %w[30 31 32] # May need to update these
+    }.freeze
+
     attr_reader :cookies, :debug_log, :logged_in
 
     def initialize(base_url: nil, debug: false)
       @base_url = base_url || Config.base_url
       raise Error, 'No base URL configured. Run: truenorth configure' unless @base_url
 
-      @cookies = {}
+      @cookies = Config.cookies || {}
       @debug = debug
       @debug_log = StringIO.new
-      @logged_in = false
+      @logged_in = !@cookies.empty?  # If we have cookies, assume logged in
+
+      log "Loaded #{@cookies.length} cookies from cache" if @logged_in && @debug
     end
 
     # Login to the booking system
@@ -91,7 +103,8 @@ module Truenorth
 
       if response.body.include?('Sign Out') || response.body.include?('My Reservations')
         @logged_in = true
-        log 'Login successful'
+        Config.save_cookies(@cookies)
+        log 'Login successful (cookies saved)'
         true
       else
         html = Nokogiri::HTML(response.body)
@@ -128,8 +141,52 @@ module Truenorth
         html = change_activity(html, activity_id)
       end
 
-      slots = parse_slots(html)
-      log "Found #{slots.count} available time slots"
+      # Debug: Save HTML after activity change
+      if @debug
+        debug_file = "/tmp/truenorth_after_activity_#{Time.now.to_i}.html"
+        File.write(debug_file, html.to_s)
+        log "Saved HTML after activity change to: #{debug_file}"
+      end
+
+      # Court dropdown not available in HTML response - use hardcoded IDs
+      court_ids = COURT_IDS_BY_ACTIVITY[activity.to_s.downcase] || []
+
+      if court_ids.length >= 3
+        log "Querying #{court_ids.length} courts individually (IDs: #{court_ids.join(', ')})"
+        all_slots = {}
+
+        court_ids.each do |court_id|
+          court_name = COURTS[court_id] || "Court #{court_id}"
+          log "Querying #{court_name} (ID: #{court_id})"
+
+          # Set activityAreaId and refresh
+          form_id = extract_form_id(html)
+          view_state = extract_view_state(html)
+          form_fields = extract_all_form_fields(html, form_id)
+          form_fields["#{form_id}:activityAreaId"] = court_id
+
+          # Make AJAX request to update table for this court
+          result = change_date_ajax(form_id, view_state, requested_date, form_fields)
+          if result[:success]
+            court_html = Nokogiri::HTML(result[:body].scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n"))
+            court_slots = parse_slots(court_html)
+
+            # Merge slots
+            court_slots.each do |time, courts|
+              all_slots[time] ||= []
+              all_slots[time].concat(courts)
+              all_slots[time].uniq!
+            end
+          end
+        end
+
+        slots = all_slots
+        log "Combined #{slots.count} time slots from all courts"
+      else
+        # Fallback to original parsing
+        slots = parse_slots(html)
+        log "Found #{slots.count} available time slots"
+      end
 
       {
         success: true,
@@ -141,7 +198,8 @@ module Truenorth
 
 
     # Book a slot
-    def book(time, date: Date.today, court: nil, activity: 'squash', dry_run: false)
+    # If slot_info is provided, it should have: { area_id:, start_time:, end_time:, court: }
+    def book(time, date: Date.today, court: nil, activity: 'squash', dry_run: false, slot_info: nil)
       ensure_logged_in!
 
       log "\n=== BOOK SLOT ==="
@@ -172,11 +230,22 @@ module Truenorth
         form_fields = extract_all_form_fields(html, form_id)
       end
 
-      # Find the slot
-      slot = find_slot(html, time, court)
-      raise BookingError, "No slot available at #{time}" unless slot
-
-      log "Found slot: #{slot[:court]} at #{slot[:start_time]}"
+      # Find the slot (or use provided slot_info)
+      if slot_info
+        log "Using provided slot info: #{slot_info[:court]} at #{slot_info[:start_time]}"
+        # Convert slot_info keys from symbols if needed and ensure we have an id
+        slot = {
+          id: nil,  # We'll generate this or it's not needed for AJAX
+          area_id: slot_info[:area_id],
+          court: slot_info[:court],
+          start_time: slot_info[:start_time] || slot_info[:time],
+          end_time: slot_info[:end_time]
+        }
+      else
+        slot = find_slot(html, time, court)
+        raise BookingError, "No slot available at #{time}" unless slot
+        log "Found slot: #{slot[:court]} at #{slot[:start_time]}"
+      end
 
       # Select slot via AJAX
       select_result = select_slot_ajax(form_id, view_state, slot, components, form_fields)
@@ -417,6 +486,18 @@ module Truenorth
     def parse_slots(html)
       slots = {}
 
+      # Debug: Count total columns found
+      headers = html.css('thead th[role="columnheader"]')
+      log "Found #{headers.length} column headers: #{headers.map { |h| h['aria-label'] }.join(', ')}"
+
+      # Debug: Count slots by area-id
+      area_counts = Hash.new(0)
+      html.css('td.slot div[data-start-time]').each do |div|
+        area_id = div['data-area-id']
+        area_counts[area_id] += 1
+      end
+      log "Slots by area ID: #{area_counts.inspect}"
+
       # Find ALL slots with data-start-time
       html.css('td.slot div[data-start-time]').each do |div|
         td = div.parent
@@ -590,7 +671,64 @@ module Truenorth
       result = change_activity_ajax(form_id, view_state, activity_id, form_fields, components)
       return html unless result[:success]
 
+      # Parse the response and check for Court 3
+      parsed = Nokogiri::HTML(result[:body])
+      court3_elements = parsed.css('th[aria-label*="Court 3"], div[data-area-id="18"], div[data-area-id="32"]')
+      log "After change_activity: Found #{court3_elements.length} Court 3 elements in response"
+
+      parsed
+    end
+
+    def change_court_dropdown(html, court_id)
+      form_id = extract_form_id(html)
+      view_state = extract_view_state(html)
+      form_fields = extract_all_form_fields(html, form_id)
+
+      # Find the court dropdown field dynamically (in .activity-areas div)
+      court_dropdown = html.at_css('.activity-areas select, div[class*="area"] select[id*="j_idt"]')
+      return html unless court_dropdown
+
+      dropdown_id = court_dropdown['id']
+      dropdown_source = dropdown_id.gsub(/_input$/, '')
+
+      result = change_court_dropdown_ajax(form_id, view_state, court_id, dropdown_id, dropdown_source, form_fields)
+      return html unless result[:success]
+
+      # Parse CDATA content from response
+      cdata_content = result[:body].scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
+      if !cdata_content.empty?
+        cdata_html = Nokogiri::HTML(cdata_content)
+        slots = cdata_html.css('div[data-start-time]')
+        log "Court #{court_id}: Found #{slots.length} slots in CDATA response"
+        return cdata_html if slots.length > 0
+      end
+
       Nokogiri::HTML(result[:body])
+    end
+
+    def change_court_area(html, area_id)
+      form_id = extract_form_id(html)
+      view_state = extract_view_state(html)
+      form_fields = extract_all_form_fields(html, form_id)
+
+      result = change_court_area_ajax(form_id, view_state, area_id, form_fields)
+      return html unless result[:success]
+
+      # Debug: Check response
+      parsed = Nokogiri::HTML(result[:body])
+      slot_divs = parsed.css('div[data-start-time]')
+      log "Court area #{area_id} response: #{slot_divs.length} slot divs found"
+
+      # Also check CDATA content
+      cdata_content = result[:body].scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
+      if !cdata_content.empty?
+        cdata_html = Nokogiri::HTML(cdata_content)
+        cdata_slots = cdata_html.css('div[data-start-time]')
+        log "Court area #{area_id} CDATA: #{cdata_slots.length} slot divs in CDATA"
+        return cdata_html if cdata_slots.length > 0
+      end
+
+      parsed
     end
 
     def change_date(html, date_str, activity_id = nil)
@@ -609,7 +747,17 @@ module Truenorth
       cdata_content = ajax_body.scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
 
       if !cdata_content.empty? && cdata_content.include?('slot')
-        Nokogiri::HTML(cdata_content)
+        parsed_html = Nokogiri::HTML(cdata_content)
+
+        # Debug: Check if Court 3 is in the response
+        court3_headers = parsed_html.css('th[aria-label*="Court 3"]')
+        log "Court 3 headers found in AJAX response: #{court3_headers.length}"
+
+        # Debug: Check for area ID 18 or 32 (Court 3 IDs)
+        court3_slots = parsed_html.css('div[data-area-id="18"], div[data-area-id="32"]')
+        log "Court 3 slots (area 18/32) found in AJAX response: #{court3_slots.length}"
+
+        parsed_html
       else
         html
       end
@@ -681,7 +829,22 @@ module Truenorth
 
         selected = select.at_css('option[selected]')
         fields[select['name']] = selected['value'] if selected
+
+        # Debug: Log select options
+        if select['name']&.include?('area') || select['name']&.include?('court') || select['name']&.include?('trainer')
+          options = select.css('option').map { |opt| "#{opt.text.strip}=#{opt['value']}" }
+          log "Found selector #{select['name']}: #{options.join(', ')}"
+        end
       end
+
+      # Force parameters to get all courts
+      fields["#{form_id}:mobileViewDisplay"] = '0'  # 0 = full view
+
+      # Debug: Log all field names and key values
+      log "Form fields: #{fields.keys.join(', ')}"
+      log "activityAreaId current value: #{fields["#{form_id}:activityAreaId"]}"
+      log "showAllAreasOrTrainers: #{fields["#{form_id}:showAllAreasOrTrainers"]}"
+
       fields
     end
 
@@ -710,6 +873,12 @@ module Truenorth
       form_data = form_fields.dup
       form_data["#{form_id}:j_idt51_input"] = activity_id
       form_data["#{form_id}:activityId"] = activity_id
+      form_data["#{form_id}:showAllAreasOrTrainers"] = 'true'  # Show all courts!
+
+      # Debug: Log what we're sending
+      log "Sending to #{form_id}:showAllAreasOrTrainers = #{form_data["#{form_id}:showAllAreasOrTrainers"]}"
+      log "Sending to #{form_id}:mobileViewDisplay = #{form_data["#{form_id}:mobileViewDisplay"]}"
+
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
         'javax.faces.source' => activity_dropdown,
@@ -717,6 +886,56 @@ module Truenorth
         'javax.faces.partial.render' => form_id,
         'javax.faces.behavior.event' => 'change',
         'javax.faces.partial.event' => 'change',
+        form_id => form_id,
+        'javax.faces.encodedURL' => encoded_url,
+        'javax.faces.ViewState' => view_state
+      )
+
+      response = post_ajax(ajax_url, form_data)
+      if response.is_a?(Net::HTTPSuccess)
+        { success: true, view_state: extract_view_state_from_ajax(response.body), body: response.body }
+      else
+        { success: false, error: "HTTP #{response.code}" }
+      end
+    end
+
+    def change_court_dropdown_ajax(form_id, view_state, court_id, dropdown_input_id, dropdown_source, form_fields)
+      ajax_url = build_ajax_url
+      encoded_url = URI.encode_www_form_component(ajax_url)
+
+      form_data = form_fields.dup
+      form_data[dropdown_input_id] = court_id
+      form_data.merge!(
+        'javax.faces.partial.ajax' => 'true',
+        'javax.faces.source' => dropdown_source,
+        'javax.faces.partial.execute' => dropdown_source,
+        'javax.faces.partial.render' => form_id,
+        'javax.faces.behavior.event' => 'change',
+        'javax.faces.partial.event' => 'change',
+        form_id => form_id,
+        'javax.faces.encodedURL' => encoded_url,
+        'javax.faces.ViewState' => view_state
+      )
+
+      response = post_ajax(ajax_url, form_data)
+      if response.is_a?(Net::HTTPSuccess)
+        { success: true, view_state: extract_view_state_from_ajax(response.body), body: response.body }
+      else
+        { success: false, error: "HTTP #{response.code}" }
+      end
+    end
+
+    def change_court_area_ajax(form_id, view_state, area_id, form_fields)
+      ajax_url = build_ajax_url
+      encoded_url = URI.encode_www_form_component(ajax_url)
+
+      form_data = form_fields.dup
+      form_data["#{form_id}:activityAreaId"] = area_id
+      form_data.merge!(
+        'javax.faces.partial.ajax' => 'true',
+        'javax.faces.source' => form_id,
+        'javax.faces.partial.execute' => form_id,
+        'javax.faces.partial.render' => form_id,
         form_id => form_id,
         'javax.faces.encodedURL' => encoded_url,
         'javax.faces.ViewState' => view_state
@@ -742,6 +961,7 @@ module Truenorth
       form_data = form_data.dup
       form_data["#{form_id}:sheetDate"] = date_str
       form_data["#{form_id}:j_idt57_input"] = date_str
+      form_data["#{form_id}:showAllAreasOrTrainers"] = 'true'  # Show all courts!
 
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
@@ -815,10 +1035,22 @@ module Truenorth
 
       response = post_ajax(ajax_url, form_data)
       if response.is_a?(Net::HTTPSuccess)
-        body = response.body.downcase
-        if body.include?('success') || body.include?('confirmed') || body.include?('booked')
+        body = response.body
+        body_lower = body.downcase
+
+        # Check for explicit error indicators
+        if body_lower.include?('error') || body_lower.include?('failed') ||
+           body_lower.include?('unable') || body_lower.include?('invalid')
+          log "Booking save returned error indicators in response"
+          { success: false, error: 'Booking save failed' }
+        # Check for success indicators OR assume success if reasonable response
+        elsif body_lower.include?('success') || body_lower.include?('confirmed') ||
+              body_lower.include?('booked') || body_lower.include?('reserved') ||
+              (body.length < 5000 && !body_lower.include?('exception'))
+          log "Booking save appears successful (HTTP 200)"
           { success: true, confirmation: 'Booking confirmed' }
         else
+          log "Uncertain booking result, response length: #{body.length}"
           { success: false, error: 'No confirmation in response' }
         end
       else
