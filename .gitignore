@@ -1,0 +1,20 @@
+/.bundle/
+/.yardoc
+/_yardoc/
+/coverage/
+/doc/
+/pkg/
+/spec/reports/
+/tmp/
+*.gem
+*.rbc
+.byebug_history
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Ignore credentials
+credentials.yml
+config.yml

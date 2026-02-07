@@ -1,0 +1,43 @@
+PATH
+  remote: .
+  specs:
+    truenorth (0.1.0)
+      base64 (~> 0.2)
+      nokogiri (~> 1.15)
+      thor (~> 1.3)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    base64 (0.3.0)
+    diff-lcs (1.6.2)
+    nokogiri (1.19.0-arm64-darwin)
+      racc (~> 1.4)
+    racc (1.8.1)
+    rake (13.3.1)
+    rspec (3.13.2)
+      rspec-core (~> 3.13.0)
+      rspec-expectations (~> 3.13.0)
+      rspec-mocks (~> 3.13.0)
+    rspec-core (3.13.6)
+      rspec-support (~> 3.13.0)
+    rspec-expectations (3.13.5)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.13.0)
+    rspec-mocks (3.13.7)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.13.0)
+    rspec-support (3.13.7)
+    thor (1.5.0)
+
+PLATFORMS
+  arm64-darwin
+
+DEPENDENCIES
+  bundler (~> 2.0)
+  rake (~> 13.0)
+  rspec (~> 3.0)
+  truenorth!
+
+BUNDLED WITH
+   2.6.9
