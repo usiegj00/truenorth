@@ -28,6 +28,9 @@ module Truenorth
       )
       log 'Browser started'
 
+      # Auto-accept any alert dialogs (e.g., "Please create reservation for the future")
+      @browser.on(:dialog) { |dialog| dialog.accept }
+
       # Maximize window in debug mode
       if @debug && @browser
         @browser.resize(width: 1920, height: 1080)
@@ -118,451 +121,150 @@ module Truenorth
 
       navigate_to_date_and_activity(date, activity)
 
-      # Find and click the slot
-      slot_info = find_and_click_slot(time, court)
+      # Find and click the slot (dispatches mousedown+mouseup, triggers reservation AJAX)
+      slot_info = find_and_click_slot(time, court, date)
       raise BookingError, "No slot available at #{time}" unless slot_info
 
       log "Clicked slot: #{slot_info[:court]} at #{slot_info[:time]}"
 
-      # Wait for dialogs to appear
-      sleep 2
-
-      # Check URL after click
-      current_url = @browser.url
-      page_title = @browser.title
-      log "After slot click - URL: #{current_url}"
-      log "After slot click - Title: #{page_title}"
-
-      # Capture what dialog appeared (for debugging)
-      if @debug
-        dialog_info = @browser.evaluate(<<~JS)
-          (function() {
-            var result = {
-              dialogsFound: 0,
-              visibleDialogs: 0,
-              dialogHtml: null,
-              allDialogIds: []
-            };
-
-            var dialogs = document.querySelectorAll('.ui-dialog');
-            result.dialogsFound = dialogs.length;
-
-            for (var i = 0; i < dialogs.length; i++) {
-              var dialog = dialogs[i];
-              var content = dialog.querySelector('.ui-dialog-content');
-              result.allDialogIds.push(content ? content.id : 'no-id');
-
-              var style = window.getComputedStyle(dialog);
-              if (style.display !== 'none' && style.visibility !== 'hidden') {
-                result.visibleDialogs++;
-                if (!result.dialogHtml) {
-                  result.dialogHtml = dialog.outerHTML;
-                }
-              }
-            }
-
-            return result;
-          })()
-        JS
-
-        log "Dialog capture info: #{dialog_info['dialogsFound']} total, #{dialog_info['visibleDialogs']} visible"
-        log "Dialog IDs: #{dialog_info['allDialogIds'].join(', ')}"
-
-        if dialog_info['dialogHtml']
-          File.write('/tmp/first_dialog.html', dialog_info['dialogHtml'])
-          log 'Saved first dialog HTML to /tmp/first_dialog.html'
-        else
-          log 'WARNING: No visible dialog HTML to capture!'
-        end
-
-        @browser.screenshot(path: '/tmp/first_dialog.png')
-        log "Saved first dialog screenshot (URL: #{@browser.url}, Title: #{@browser.title})"
-      end
-
-      # Close legends dialog if it appears
-      legends_closed = @browser.evaluate(<<~JS)
+      # Check if reservation panel appeared with Save button
+      panel_state = @browser.evaluate(<<~JS)
         (function() {
-          var dialogs = document.querySelectorAll('.ui-dialog');
-          for (var i = 0; i < dialogs.length; i++) {
-            var dialog = dialogs[i];
-            if (dialog.style.display === 'none') continue;
-            var legendsContent = dialog.querySelector('[id*="legends_content"]');
-            if (legendsContent) {
-              var closeBtn = dialog.querySelector('a.cross');
-              if (closeBtn) {
-                closeBtn.click();
-                return true;
-              }
-            }
-          }
-          return false;
+          var panel = document.querySelector('[id*="reservationPanel"]');
+          var saveBtn = document.querySelector('.btn-save');
+          var fromTime = document.querySelector('select[name*="fromTime_input"]');
+          return {
+            hasPanel: !!panel,
+            panelVisible: panel ? panel.offsetWidth > 0 : false,
+            hasSaveBtn: !!saveBtn,
+            saveBtnVisible: saveBtn ? saveBtn.offsetWidth > 0 : false,
+            saveBtnId: saveBtn ? saveBtn.id : null,
+            fromTime: fromTime ? fromTime.value : null
+          };
         })()
       JS
+      log "Reservation panel: #{panel_state.inspect}"
 
-      if legends_closed
-        log 'Closed legends dialog, clicking slot again...'
-        sleep 1
-
-        # Click the slot again to open booking dialog
-        click_result = @browser.evaluate(<<~JS)
-          (function() {
-            var div = document.querySelector('div[data-area-id="' + #{slot_info[:area_id]} + '"]');
-            if (!div) return { clicked: false, reason: 'slot not found' };
-
-            var td = div.parentElement;
-            while (td && td.tagName !== 'TD') {
-              td = td.parentElement;
-            }
-            if (!td) return { clicked: false, reason: 'td not found' };
-
-            // Click and immediately check for dialog or auto-booking
-            td.click();
-
-            // Wait just a tiny bit for potential dialog
-            var startTime = Date.now();
-            while (Date.now() - startTime < 500) {
-              // Busy wait for 500ms
-            }
-
-            // Check what happened
-            var dialogs = document.querySelectorAll('.ui-dialog');
-            var visibleDialogs = 0;
-            var saveButton = null;
-
-            for (var i = 0; i < dialogs.length; i++) {
-              var dialog = dialogs[i];
-              var style = window.getComputedStyle(dialog);
-              if (style.display === 'none' || style.visibility === 'hidden') continue;
-
-              visibleDialogs++;
-
-              // Try to find and click save button immediately
-              var btn =
-                dialog.querySelector('a.btn-save') ||
-                dialog.querySelector('button.btn-save') ||
-                dialog.querySelector('a[id*="save"]') ||
-                dialog.querySelector('button[id*="save"]') ||
-                dialog.querySelector('a.ui-commandlink:not(.cross)') ||
-                dialog.querySelector('.ui-button:not(.ui-dialog-titlebar-close):not(.cross)') ||
-                dialog.querySelector('a.ui-area-btn-success') ||
-                dialog.querySelector('button[type="submit"]');
-
-              if (btn) {
-                btn.click();
-                saveButton = { id: btn.id, text: btn.textContent.trim() };
-                break;
-              }
-            }
-
-            return {
-              clicked: true,
-              visibleDialogs: visibleDialogs,
-              saveButton: saveButton,
-              saveClicked: !!saveButton
-            };
-          })()
-        JS
-
-        log "Second click result: #{click_result.inspect}"
-
-        if click_result['saveClicked']
-          log "Save button clicked immediately after dialog opened!"
-          sleep 3
-          page_text = @browser.evaluate('document.body.textContent')
-          if page_text =~ /confirmed|success|booked|reservation.*created/i
-            log 'Booking appears confirmed based on page content'
-            return {
-              success: true,
-              court: slot_info[:court],
-              time: "#{slot_info[:time]} - #{(Time.parse(slot_info[:time]) + 3600).strftime('%-I:%M %p').upcase}",
-              confirmation: 'Booking confirmed'
-            }
-          end
-        end
-
-        # In debug mode, wait so user can see the browser
+      unless panel_state['saveBtnVisible']
+        log 'Save button not visible after slot click'
         if @debug
-          log 'DEBUG: Waiting 10 seconds so you can see the browser state...'
-          sleep 10
-        else
-          sleep 2
+          @browser.screenshot(path: '/tmp/no_save_btn.png', full: true)
+          log 'Saved screenshot to /tmp/no_save_btn.png'
         end
-      end
-
-      # Check if booking dialog opened
-      dialog_visible = @browser.evaluate(<<~JS)
-        (function() {
-          var dialogs = document.querySelectorAll('.ui-dialog');
-          for (var i = 0; i < dialogs.length; i++) {
-            var dialog = dialogs[i];
-            if (dialog.style.display === 'none') continue;
-            // Make sure it's not the legends dialog
-            var isLegends = !!dialog.querySelector('[id*="legends_content"]');
-            if (!isLegends) return true;
-          }
-          return false;
-        })()
-      JS
-
-      unless dialog_visible
-        log 'ERROR: Booking dialog did not open!'
-        if @debug
-          @browser.screenshot(path: '/tmp/no_dialog.png')
-          log 'Saved screenshot to /tmp/no_dialog.png'
-        end
-        raise BookingError, 'Booking dialog did not open after clicking slot'
-      end
-
-      log 'Booking dialog opened'
-
-      # Capture dialog HTML for debugging
-      if @debug
-        dialog_html = @browser.evaluate(<<~JS)
-          (function() {
-            var dialogs = document.querySelectorAll('.ui-dialog');
-            for (var i = 0; i < dialogs.length; i++) {
-              var dialog = dialogs[i];
-              var style = window.getComputedStyle(dialog);
-              if (style.display !== 'none' && style.visibility !== 'hidden') {
-                return dialog.outerHTML;
-              }
-            }
-            return null;
-          })()
-        JS
-
-        if dialog_html
-          File.write('/tmp/booking_dialog.html', dialog_html)
-          log 'Saved booking dialog HTML to /tmp/booking_dialog.html'
-        end
-
-        @browser.screenshot(path: '/tmp/booking_dialog.png')
-        log 'Saved screenshot to /tmp/booking_dialog.png'
+        raise BookingError, 'Reservation panel did not appear after clicking slot'
       end
 
       if dry_run
-        log 'Dry run - closing dialog without booking'
-        close_dialog
+        log 'Dry run - not clicking Save'
         return {
           success: true,
           dry_run: true,
           court: slot_info[:court],
-          time: time,
-          message: 'Dry run completed - booking dialog opened successfully'
+          time: slot_info[:time],
+          message: "Dry run - reservation panel opened for #{slot_info[:court]} at #{slot_info[:time]}"
         }
       end
 
-      # Try to find and click the save button in the browser
-      log 'Looking for save button in dialog...'
-      sleep 1  # Quick check before dialog might close
-
-      # Check for save button immediately
-      quick_check = @browser.evaluate(<<~JS)
+      # Click the Save button
+      log 'Clicking Save button...'
+      save_btn_id = panel_state['saveBtnId']
+      @browser.evaluate(<<~JS)
         (function() {
-          var dialogs = document.querySelectorAll('.ui-dialog');
-          var visibleCount = 0;
-          var saveButton = null;
-
-          for (var i = 0; i < dialogs.length; i++) {
-            var dialog = dialogs[i];
-            var style = window.getComputedStyle(dialog);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-
-            visibleCount++;
-
-            // Try to find save button
-            var btn =
-              dialog.querySelector('a.btn-save') ||
-              dialog.querySelector('button.btn-save') ||
-              dialog.querySelector('a[id*="save"]') ||
-              dialog.querySelector('button[id*="save"]') ||
-              dialog.querySelector('a.ui-commandlink:not(.cross)') ||
-              dialog.querySelector('.ui-button:not(.ui-dialog-titlebar-close):not(.cross)') ||
-              dialog.querySelector('a.ui-area-btn-success') ||
-              dialog.querySelector('button[type="submit"]');
-
-            if (btn) {
-              saveButton = {
-                id: btn.id || '',
-                text: btn.textContent.trim(),
-                className: btn.className || ''
-              };
-              btn.click();
-              return { found: true, clicked: true, button: saveButton, visibleCount: visibleCount };
-            }
-          }
-
-          return { found: false, clicked: false, visibleCount: visibleCount };
+          var btn = document.getElementById('#{save_btn_id}');
+          if (btn) btn.click();
         })()
       JS
 
-      log "Quick check result: #{quick_check.inspect}"
+      # Wait for save AJAX to complete
+      wait_for_ajax(timeout: 10)
+      sleep 2
 
-      if quick_check['clicked']
-        log "Save button clicked immediately!"
-        sleep 3
-        page_text = @browser.evaluate('document.body.textContent')
-        if page_text =~ /confirmed|success|booked/i
-          log 'Booking confirmed'
-          return {
-            success: true,
-            court: slot_info[:court],
-            time: "#{slot_info[:time]} - #{(Time.parse(slot_info[:time]) + 3600).strftime('%-I:%M %p').upcase}",
-            confirmation: 'Booking confirmed'
-          }
-        end
-      end
-
-      sleep 2  # Wait a bit more
-
-      # Get dialog info (any visible dialog)
-      dialog_info = @browser.evaluate(<<~JS)
+      # Check for success or error
+      result_state = @browser.evaluate(<<~JS)
         (function() {
-          var dialogs = document.querySelectorAll('.ui-dialog');
-          var visibleDialogs = [];
+          var body = document.body.textContent;
 
-          // Find all visible dialogs
-          for (var i = 0; i < dialogs.length; i++) {
-            var dialog = dialogs[i];
-            var style = window.getComputedStyle(dialog);
-            if (style.display !== 'none' && style.visibility !== 'hidden') {
-              visibleDialogs.push(dialog);
-            }
+          // Check for PrimeFaces error messages
+          var msgs = document.querySelectorAll('.ui-messages-error, .ui-message-error');
+          var errors = [];
+          for (var i = 0; i < msgs.length; i++) {
+            var txt = msgs[i].textContent.trim();
+            if (txt) errors.push(txt);
           }
 
-          if (visibleDialogs.length === 0) return { found: false, count: 0 };
-
-          // Use the last visible dialog (most recently opened)
-          var dialog = visibleDialogs[visibleDialogs.length - 1];
-
-          // Find all buttons in this dialog
-          var buttons = [];
-          var allBtns = dialog.querySelectorAll('a, button');
-          for (var j = 0; j < allBtns.length; j++) {
-            var btn = allBtns[j];
-            buttons.push({
-              tag: btn.tagName,
-              id: btn.id || '',
-              className: btn.className || '',
-              text: btn.textContent.trim(),
-              disabled: btn.disabled || btn.className.indexOf('disabled') > -1
-            });
+          // Check PrimeFaces Growl notifications (success/error popups)
+          var growlMsgs = document.querySelectorAll('.ui-growl-message, .ui-growl-item');
+          var growls = [];
+          for (var i = 0; i < growlMsgs.length; i++) {
+            var summary = growlMsgs[i].querySelector('.ui-growl-title');
+            var detail = growlMsgs[i].querySelector('.ui-growl-message');
+            var text = (summary ? summary.textContent : '') + ' ' + (detail ? detail.textContent : '');
+            if (!text.trim()) text = growlMsgs[i].textContent.trim();
+            if (text.trim()) growls.push(text.trim());
           }
 
-          var content = dialog.querySelector('.ui-dialog-content');
+          // Check if reservation panel is gone (success) or still showing (error)
+          var panel = document.querySelector('[id*="reservationPanel"]');
+          var panelVisible = panel ? panel.offsetWidth > 0 : false;
+          var saveBtn = document.querySelector('.btn-save');
+          var saveBtnVisible = saveBtn ? saveBtn.offsetWidth > 0 : false;
+
+          // Check for Back button (visible means we're still on the reservation form)
+          var backBtn = document.querySelector('.btn-back');
+          var backBtnVisible = backBtn ? backBtn.offsetWidth > 0 : false;
+
+          var bodyLower = body.toLowerCase();
           return {
-            found: true,
-            count: visibleDialogs.length,
-            contentId: content ? content.id : '',
-            buttons: buttons,
-            html: dialog.innerHTML.substring(0, 1000)
+            errors: errors,
+            growls: growls,
+            panelStillVisible: panelVisible,
+            saveBtnStillVisible: saveBtnVisible,
+            backBtnStillVisible: backBtnVisible,
+            hasConfirmation: bodyLower.indexOf('confirmed') > -1 ||
+                             bodyLower.indexOf('success') > -1 ||
+                             bodyLower.indexOf('booked') > -1 ||
+                             bodyLower.indexOf('reservation has been') > -1
           };
         })()
       JS
+      log "After save: #{result_state.inspect}"
 
-      log "Dialog info: #{dialog_info.inspect}"
+      if @debug
+        @browser.screenshot(path: '/tmp/after_save.png', full: true)
+        log 'Saved screenshot to /tmp/after_save.png'
+      end
 
-      # Try multiple save button selectors (use last visible dialog)
-      save_result = @browser.evaluate(<<~JS)
-        (function() {
-          // Find all visible dialogs
-          var dialogs = document.querySelectorAll('.ui-dialog');
-          var visibleDialogs = [];
-          for (var i = 0; i < dialogs.length; i++) {
-            var dialog = dialogs[i];
-            var style = window.getComputedStyle(dialog);
-            if (style.display !== 'none' && style.visibility !== 'hidden') {
-              visibleDialogs.push(dialog);
-            }
-          }
+      if result_state['errors'].any?
+        raise BookingError, "Booking failed: #{result_state['errors'].join(', ')}"
+      end
 
-          if (visibleDialogs.length === 0) return { clicked: false, reason: 'no visible dialogs' };
+      # Check growl messages for errors
+      growl_errors = result_state['growls'].select { |g| g =~ /error|fail|unable|invalid/i }
+      if growl_errors.any?
+        raise BookingError, "Booking failed: #{growl_errors.join(', ')}"
+      end
 
-          // Use the last visible dialog (most recently opened)
-          var targetDialog = visibleDialogs[visibleDialogs.length - 1];
+      # Success indicators:
+      # 1. Save button disappeared (panel closed after successful save)
+      # 2. Confirmation text in body or growl
+      # 3. Back button gone (returned to slot view)
+      growl_success = result_state['growls'].any? { |g| g =~ /success|confirm|booked|reserved/i }
 
-          // Try to find save/submit button in this dialog
-          var saveBtn =
-            targetDialog.querySelector('a.btn-save') ||
-            targetDialog.querySelector('button.btn-save') ||
-            targetDialog.querySelector('a[id*="save"]') ||
-            targetDialog.querySelector('button[id*="save"]') ||
-            targetDialog.querySelector('a.ui-commandlink:not(.cross)') ||
-            targetDialog.querySelector('.ui-button:not(.ui-dialog-titlebar-close):not(.cross)') ||
-            targetDialog.querySelector('a.ui-area-btn-success') ||
-            targetDialog.querySelector('button[type="submit"]');
-
-          if (saveBtn) {
-            var btnInfo = {
-              id: saveBtn.id || '',
-              className: saveBtn.className || '',
-              text: saveBtn.textContent.trim(),
-              disabled: saveBtn.disabled || saveBtn.className.indexOf('disabled') > -1
-            };
-            console.log('Found save button:', saveBtn.id || saveBtn.className);
-            saveBtn.click();
-            return { clicked: true, button: btnInfo };
-          }
-          return { clicked: false, reason: 'no save button found', dialogCount: visibleDialogs.length };
-        })()
-      JS
-
-      save_clicked = save_result['clicked']
-      log "Save button result: #{save_result.inspect}" if save_result['button']
-
-      if save_clicked
-        log 'Save button clicked, waiting for confirmation...'
-        sleep 3
-
-        # Check for success message
-        page_text = @browser.evaluate('document.body.textContent')
-        if page_text =~ /confirmed|success|booked/i
-          log 'Booking confirmed'
-          return {
-            success: true,
-            court: slot_info[:court],
-            time: "#{slot_info[:time]} - #{(Time.parse(slot_info[:time]) + 3600).strftime('%-I:%M %p').upcase}",
-            confirmation: 'Booking confirmed'
-          }
-        else
-          log 'Warning: Save button clicked but no confirmation message detected'
-          return {
-            success: false,
-            error: 'Booking uncertain - please check My Reservations'
-          }
-        end
+      if !result_state['saveBtnStillVisible'] || result_state['hasConfirmation'] || growl_success
+        confirmation_msg = result_state['growls'].first || 'Booking confirmed'
+        log "Booking confirmed: #{confirmation_msg}"
+        {
+          success: true,
+          court: slot_info[:court],
+          time: slot_info[:time],
+          confirmation: confirmation_msg
+        }
       else
-        log 'No save button found, falling back to HTTP client approach'
-
-        # Fallback to HTTP client approach
-        http_client = Client.new(debug: @debug)
-
-        # Transfer cookies from browser to HTTP client
-        browser_cookies = @browser.cookies.all
-        browser_cookies.each do |name, cookie|
-          http_client.cookies[name] = cookie.value
-        end
-
-        # Calculate end time (assuming 1-hour slots)
-        start_time_obj = Time.parse(slot_info[:time])
-        end_time = (start_time_obj + 3600).strftime('%-I:%M %p').upcase
-
-        # Pass the slot info directly to avoid re-finding
-        result = http_client.book(
-          time,
-          date: date,
-          court: court,
-          activity: activity,
-          dry_run: false,
-          slot_info: {
-            area_id: slot_info[:area_id],
-            court: slot_info[:court],
-            start_time: slot_info[:time],
-            end_time: end_time
-          }
-        )
-
-        result
+        log 'Booking status uncertain - check My Reservations'
+        {
+          success: false,
+          error: 'Booking uncertain - please check My Reservations'
+        }
       end
     ensure
       quit
@@ -646,46 +348,173 @@ module Truenorth
       @browser.go_to("#{@base_url}/group/pages/facility-booking")
       sleep 3
 
-      # Select activity
       activity_id = Client::ACTIVITIES[activity.to_s.downcase] || '5'
-      select_activity(activity_id)
-      sleep 5
 
-      # TODO: Navigate to specific date if not today
-      current_url = @browser.url
-      page_title = @browser.title
-      log "Navigated to #{activity} for #{date}"
-      log "Current URL: #{current_url}"
-      log "Page title: #{page_title}"
-    end
+      # Step 1: Change activity via PrimeFaces SelectOneMenu widget (triggers AJAX)
+      # This updates the server-side activity. Do NOT reload - that resets to default (golf).
+      select_activity_ui(activity_id)
+      wait_for_ajax
 
-    def select_activity(activity_id)
-      log "Selecting activity ID: #{activity_id}"
-      @browser.execute(<<~JS)
+      # Step 2: Navigate to correct date - the dateSelect AJAX renders the table
+      # with the correct activity from the session updated in step 1
+      navigate_to_date(date, force: true)
+      wait_for_ajax
+
+      # No extra sheetDate fix needed - the Calendar widget properly updates the server
+
+      # Verify correct activity courts are shown
+      verify = @browser.evaluate(<<~JS)
         (function() {
-          var select = document.querySelector('select[id*="j_idt51_input"]');
-          if (select) {
-            select.value = '#{activity_id}';
-            PrimeFaces.ab({
-              s: "_activities_WAR_northstarportlet_:activityForm:j_idt51",
-              e: "change",
-              f: "_activities_WAR_northstarportlet_:activityForm",
-              p: "_activities_WAR_northstarportlet_:activityForm:j_idt51",
-              u: "_activities_WAR_northstarportlet_:activityForm"
-            });
+          var slots = document.querySelectorAll('td.slot div[data-area-id]');
+          var areaIds = {};
+          for (var i = 0; i < slots.length; i++) {
+            var aid = slots[i].getAttribute('data-area-id');
+            areaIds[aid] = (areaIds[aid] || 0) + 1;
           }
+          return { totalSlots: slots.length, areaIds: areaIds };
         })()
       JS
+      log "After navigation - slots: #{verify['totalSlots']}, areas: #{verify['areaIds']}"
+
+      log "Navigated to #{activity} for #{date}"
     end
 
-    def find_and_click_slot(target_time, preferred_court)
+    def wait_for_ajax(timeout: 15)
+      timeout.times do |i|
+        sleep 1
+        idle = @browser.evaluate(<<~JS)
+          (function() {
+            try {
+              if (typeof PrimeFaces !== 'undefined' && PrimeFaces.ajax) {
+                if (PrimeFaces.ajax.Queue && PrimeFaces.ajax.Queue.isEmpty) {
+                  return PrimeFaces.ajax.Queue.isEmpty();
+                }
+                // Older PrimeFaces versions
+                if (PrimeFaces.ajax.QUEUE && PrimeFaces.ajax.QUEUE.isEmpty) {
+                  return PrimeFaces.ajax.QUEUE.isEmpty();
+                }
+              }
+              return true;
+            } catch(e) { return true; }
+          })()
+        JS
+        if idle
+          log "AJAX completed after #{i + 1} seconds" if @debug
+          break
+        end
+      end
+      sleep 1 # Extra buffer for DOM rendering
+    end
+
+    def select_activity_ui(activity_id)
+      log "Selecting activity ID: #{activity_id}"
+
+      # Use PrimeFaces SelectOneMenu widget's selectItem method (non-silent)
+      # This fires the change behavior AJAX, properly updating the server session
+      result = @browser.evaluate(<<~JS)
+        (function() {
+          for (var key in PrimeFaces.widgets) {
+            var w = PrimeFaces.widgets[key];
+            if (!w.input || !w.input[0] || w.input[0].tagName !== 'SELECT') continue;
+            var sel = w.input[0];
+
+            var targetIdx = -1;
+            for (var i = 0; i < sel.options.length; i++) {
+              if (sel.options[i].value === '#{activity_id}') {
+                targetIdx = i;
+                break;
+              }
+            }
+            if (targetIdx === -1) continue;
+
+            var oldValue = sel.value;
+            if (oldValue === '#{activity_id}') {
+              return { success: true, method: 'already_selected', value: oldValue };
+            }
+
+            // selectItem without silent flag triggers the change behavior AJAX
+            w.selectItem(w.items.eq(targetIdx));
+
+            return {
+              success: true, method: 'ui_click',
+              oldValue: oldValue, newValue: sel.value,
+              targetIdx: targetIdx, widgetKey: key
+            };
+          }
+          return { error: 'widget not found' };
+        })()
+      JS
+      log "Activity select result: #{result.inspect}"
+    end
+
+    def navigate_to_date(date, force: false)
+      target_str = date.strftime('%m/%d/%Y')
+
+      current_date = @browser.evaluate(<<~JS)
+        (function() {
+          var input = document.querySelector('input[name*="sheetDate"]');
+          return input ? input.value : null;
+        })()
+      JS
+
+      if current_date == target_str && !force
+        log "Already on correct date: #{target_str}"
+        return
+      end
+
+      log "Navigating from #{current_date} to #{target_str}"
+
+      # Use the Calendar widget (j_idt79) which has setDate + dateSelect behavior.
+      # This properly updates the server's session date, unlike directly setting
+      # the sheetDate input which only updates the display.
+      result = @browser.evaluate(<<~JS)
+        (function() {
+          var parts = '#{target_str}'.split('/');
+          var targetDate = new Date(parseInt(parts[2]), parseInt(parts[0]) - 1, parseInt(parts[1]));
+
+          // Find the Calendar widget with setDate + dateSelect behavior
+          for (var key in PrimeFaces.widgets) {
+            var w = PrimeFaces.widgets[key];
+            if (typeof w.setDate !== 'function') continue;
+            if (!w.cfg || !w.cfg.behaviors || !w.cfg.behaviors.dateSelect) continue;
+
+            w.setDate(targetDate);
+            w.cfg.behaviors.dateSelect.call(w, {
+              params: [{ name: w.id + '_selectedDate', value: targetDate.getTime() }]
+            });
+            return { success: true, method: 'setDate+behavior', widgetKey: key };
+          }
+
+          // Fallback: click the day tab link if target is within the visible week
+          var dayLinks = document.querySelectorAll('a[id*="j_idt98"]');
+          for (var i = 0; i < dayLinks.length; i++) {
+            var dayNum = dayLinks[i].textContent.match(/\\b(\\d{1,2})\\b/);
+            if (dayNum && parseInt(dayNum[1]) === parseInt(parts[1])) {
+              dayLinks[i].click();
+              return { success: true, method: 'dayTab_click', day: dayNum[1] };
+            }
+          }
+
+          return { error: 'No Calendar widget or matching day tab found' };
+        })()
+      JS
+      log "Date navigation result: #{result.inspect}"
+    end
+
+    def find_and_click_slot(target_time, preferred_court, booking_date = Date.today)
       # Normalize time
       normalized_time = target_time.strip.gsub(/^0/, '').upcase
 
-      # Find all open slots matching the time
+      # Only filter past-time slots for today/past dates.
+      # The page erroneously applies past-time class to future dates based on current time of day,
+      # but the server accepts bookings for those slots fine.
+      is_today = booking_date <= Date.today
+      slot_selector = is_today ? 'td.slot.open:not(.past-time)' : 'td.slot.open'
+
+      # Find all open slots
       slots = @browser.evaluate(<<~JS)
         (function() {
-          var openSlots = document.querySelectorAll('td.slot.open');
+          var openSlots = document.querySelectorAll('#{slot_selector}');
           var result = [];
           for (var i = 0; i < openSlots.length; i++) {
             var td = openSlots[i];
@@ -694,10 +523,12 @@ module Truenorth
             var div = td.querySelector('div[data-start-time]');
             var areaId = div ? div.getAttribute('data-area-id') : null;
 
-            if (time && areaId) {
+            if (areaId) {
               result.push({
                 time: time,
-                areaId: areaId
+                areaId: areaId,
+                startTime: div ? div.getAttribute('data-start-time') : '',
+                endTime: div ? div.getAttribute('data-end-time') : ''
               });
             }
           }
@@ -705,9 +536,15 @@ module Truenorth
         })()
       JS
 
-      # Find matching slot
+      # Debug: show available times
+      unique_times = slots.map { |s| s['startTime'] }.uniq.sort
+      log "Available times (#{slots.length} bookable slots): #{unique_times.first(10).join(', ')}#{unique_times.length > 10 ? '...' : ''}"
+      log "Looking for: '#{normalized_time}'"
+
+      # Find matching slot by time display or data-start-time
       matching_slot = slots.find do |slot|
-        time_match = slot['time'].gsub(/^0/, '').upcase == normalized_time
+        time_match = slot['time'].gsub(/^0/, '').upcase == normalized_time ||
+                     slot['startTime'].gsub(/^0/, '').upcase == normalized_time
         court_match = if preferred_court
                         court_name = Client::COURTS[slot['areaId']]
                         court_name&.downcase&.include?(preferred_court.downcase)
@@ -719,73 +556,34 @@ module Truenorth
 
       return nil unless matching_slot
 
-      # Click the slot
       court_name = Client::COURTS[matching_slot['areaId']]
-      log "Clicking slot: #{court_name} at #{matching_slot['time']}"
+      log "Clicking slot: #{court_name} at #{matching_slot['startTime']}"
 
-      # Find and click using the area ID
-      @browser.execute(<<~JS, matching_slot['areaId'])
+      # Call rc_showReservationScreen directly with slot parameters.
+      # This bypasses the client-side past-time check (which erroneously blocks
+      # future-date slots) and fires the PrimeFaces AJAX to open the reservation panel.
+      click_result = @browser.evaluate(<<~JS)
         (function() {
-          var div = document.querySelector('div[data-area-id="' + arguments[0] + '"]');
-          if (div) {
-            var td = div.parentElement;
-            while (td && td.tagName !== 'TD') {
-              td = td.parentElement;
-            }
-            if (td) td.click();
-          }
+          rc_showReservationScreen([
+            {name: 'activityAreaId', value: '#{matching_slot['areaId']}'},
+            {name: 'startTime', value: '#{matching_slot['startTime']}'},
+            {name: 'endTime', value: '#{matching_slot['endTime']}'}
+          ]);
+          return { success: true, areaId: '#{matching_slot['areaId']}', startTime: '#{matching_slot['startTime']}' };
         })()
       JS
+      log "Slot click result: #{click_result.inspect}"
+
+      wait_for_ajax
+      sleep 1
 
       {
         court: court_name,
-        time: matching_slot['time'],
+        time: matching_slot['startTime'],
         area_id: matching_slot['areaId']
       }
     end
 
-    def close_dialog
-      @browser.execute(<<~JS)
-        (function() {
-          var closeBtn = document.querySelector('.ui-dialog-titlebar-close');
-          if (closeBtn) closeBtn.click();
-        })()
-      JS
-    end
-
-    def submit_booking
-      log 'Submitting booking...'
-
-      # Try to find and trigger the save button via PrimeFaces
-      success = @browser.execute(<<~JS)
-        (function() {
-          // Look for the save button anywhere on the page
-          var saveBtn = document.querySelector('a.btn-save, button.btn-save') ||
-                       document.querySelector('a[id*="save"]') ||
-                       document.querySelector('button[id*="save"]') ||
-                       document.querySelector('.ui-dialog a.ui-commandlink') ||
-                       document.querySelector('.ui-dialog button[type="button"]');
-
-          if (saveBtn) {
-            console.log('Clicking save button:', saveBtn.id);
-            saveBtn.click();
-            return true;
-          }
-
-          // If no button found, try submitting via form
-          var form = document.querySelector('form[id*="activityForm"]');
-          if (form) {
-            console.log('Submitting form');
-            form.submit();
-            return true;
-          }
-
-          return false;
-        })()
-      JS
-
-      log "Booking submission triggered: #{success}"
-    end
 
     def parse_reservations_table
       reservations = []

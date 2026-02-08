@@ -28,23 +28,22 @@ module Truenorth
       'meeting' => '8'
     }.freeze
 
-    # Court area IDs
+    # Court area IDs (from page column headers)
     COURTS = {
-      '16' => 'Squash Court 1',
-      '17' => 'Squash Court 2',
-      '18' => 'Squash Court 3',
-      '30' => 'Court 1',
-      '31' => 'Court 2',
-      '32' => 'Court 3'
+      '16' => 'Golf Simulator 1',
+      '17' => 'Golf Simulator 2',
+      '30' => 'Squash Court 1',
+      '31' => 'Squash Court 2',
+      '32' => 'Squash Court 3'
     }.freeze
 
     # Court IDs by activity
     COURT_IDS_BY_ACTIVITY = {
-      'squash' => %w[16 17 18],
-      'golf' => %w[30 31 32],
-      'music' => %w[16 17 18],  # May need to update these
-      'room' => %w[30 31 32],   # May need to update these
-      'meeting' => %w[30 31 32] # May need to update these
+      'squash' => %w[30 31 32],
+      'golf' => %w[16 17],
+      'music' => %w[16 17],    # May need to update these
+      'room' => %w[30 31 32],  # May need to update these
+      'meeting' => %w[30 31 32]
     }.freeze
 
     attr_reader :cookies, :debug_log, :logged_in

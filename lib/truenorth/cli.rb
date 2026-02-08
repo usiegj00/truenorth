@@ -117,9 +117,10 @@ module Truenorth
     rescue Error => e
       say "Error: #{e.message}", :red
 
-      # If no slot available, show nearby available times
+      # If no slot available, show nearby available times using HTTP client
       if e.message.include?('No slot available')
-        show_nearby_availability(client, date, time, activity)
+        http_client = Client.new(debug: options[:debug])
+        show_nearby_availability(http_client, date, time, activity)
       end
 
       exit 1

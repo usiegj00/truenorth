@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    truenorth (0.5.0)
+    truenorth (0.5.1)
       base64 (~> 0.2)
       ferrum (~> 0.15)
       nokogiri (~> 1.15)
