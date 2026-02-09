@@ -55,7 +55,8 @@ module Truenorth
       @cookies = Config.cookies || {}
       @debug = debug
       @debug_log = StringIO.new
-      @logged_in = !@cookies.empty?  # If we have cookies, assume logged in
+      @logged_in = !@cookies.empty?  # If we have cookies, will verify on first use
+      @last_verified_response = nil
 
       log "Loaded #{@cookies.length} cookies from cache" if @logged_in && @debug
     end
@@ -285,7 +286,9 @@ module Truenorth
 
       log "\n=== GET RESERVATIONS ==="
 
-      response = get(RESERVATIONS_PATH)
+      # Reuse the response from session verification if available
+      response = @last_verified_response || get(RESERVATIONS_PATH)
+      @last_verified_response = nil
       html = Nokogiri::HTML(response.body)
 
       reservations = []
@@ -477,9 +480,29 @@ module Truenorth
     private
 
     def ensure_logged_in!
-      return if @logged_in
+      if @logged_in
+        # Verify cached session is still valid with a lightweight check
+        response = get(RESERVATIONS_PATH)
+        if authenticated_response?(response)
+          @last_verified_response = response
+          return
+        end
+
+        # Session expired - clear stale state and re-login
+        log 'Session expired, re-authenticating...'
+        @logged_in = false
+        @cookies = {}
+      end
 
       login
+    end
+
+    # Check if a response is from an authenticated session (not a login page)
+    def authenticated_response?(response)
+      return false unless response.is_a?(Net::HTTPSuccess)
+
+      body = response.body
+      !body.include?('LoginPortlet') && body.include?('Sign Out')
     end
 
     def parse_slots(html)
