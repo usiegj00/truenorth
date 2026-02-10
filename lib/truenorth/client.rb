@@ -146,7 +146,6 @@ module Truenorth
       updated_fields = extract_all_form_fields(html, form_id)
       updated_fields = form_fields.dup if updated_fields.empty?
       updated_fields["#{form_id}:activityId"] = activity_id
-      updated_fields["#{form_id}:j_idt51_input"] = activity_id
       updated_fields["#{form_id}:sheetDate"] = requested_date
 
       result = change_activity_ajax(form_id, view_state, activity_id, updated_fields, components)
@@ -199,7 +198,6 @@ module Truenorth
       updated_fields = extract_all_form_fields(html, form_id)
       updated_fields = form_fields.dup if updated_fields.empty?
       updated_fields["#{form_id}:activityId"] = activity_id
-      updated_fields["#{form_id}:j_idt51_input"] = activity_id
       updated_fields["#{form_id}:sheetDate"] = requested_date
 
       result = change_activity_ajax(form_id, view_state, activity_id, updated_fields, components)
@@ -796,7 +794,9 @@ module Truenorth
       # Override activity ID if provided
       if activity_id
         data["#{form_id}:activityId"] = activity_id.to_s
-        data["#{form_id}:j_idt51_input"] = activity_id.to_s
+        # Also set the activity dropdown input (dynamically detected)
+        activity_source = find_activity_source(data, form_id)
+        data["#{activity_source}_input"] = activity_id.to_s
       end
 
       data
@@ -823,6 +823,33 @@ module Truenorth
       end
 
       components
+    end
+
+    # Dynamically find the activity dropdown component ID (PrimeFaces selectOneMenu).
+    # SelectOneMenu has both _focus and _input suffixed fields; calendar only has _input.
+    def find_activity_source(form_fields, form_id)
+      prefix = "#{form_id}:"
+      form_fields.each_key do |key|
+        next unless key.start_with?(prefix) && key.end_with?('_focus')
+
+        base = key.sub(/_focus$/, '')
+        return base if form_fields.key?("#{base}_input") && base =~ /j_idt\d+$/
+      end
+      "#{form_id}:j_idt67" # fallback
+    end
+
+    # Dynamically find the date picker component ID (PrimeFaces calendar).
+    # Calendar has _input but no _focus (selectOneMenu has both).
+    def find_date_picker_source(form_fields, form_id)
+      prefix = "#{form_id}:"
+      form_fields.each_key do |key|
+        next unless key.start_with?(prefix) && key.end_with?('_input') && key =~ /j_idt\d+_input$/
+
+        base = key.sub(/_input$/, '')
+        # Calendar has _input but no _focus
+        return base unless form_fields.key?("#{base}_focus")
+      end
+      "#{form_id}:j_idt79" # fallback
     end
 
     def extract_all_form_fields(html, form_id)
@@ -875,18 +902,16 @@ module Truenorth
     end
 
     def change_activity_ajax(form_id, view_state, activity_id, form_fields, _components)
-      activity_dropdown = "#{form_id}:j_idt51"
+      activity_dropdown = find_activity_source(form_fields, form_id)
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
       form_data = form_fields.dup
-      form_data["#{form_id}:j_idt51_input"] = activity_id
+      form_data["#{activity_dropdown}_input"] = activity_id
       form_data["#{form_id}:activityId"] = activity_id
       form_data["#{form_id}:showAllAreasOrTrainers"] = 'true'  # Show all courts!
 
-      # Debug: Log what we're sending
-      log "Sending to #{form_id}:showAllAreasOrTrainers = #{form_data["#{form_id}:showAllAreasOrTrainers"]}"
-      log "Sending to #{form_id}:mobileViewDisplay = #{form_data["#{form_id}:mobileViewDisplay"]}"
+      log "Activity dropdown source: #{activity_dropdown}"
 
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
@@ -961,16 +986,16 @@ module Truenorth
     def change_date_ajax(form_id, view_state, date_str, form_data)
       return { success: false, error: 'No form_id' } unless form_id
 
-      date_picker = "#{form_id}:j_idt57"
+      date_picker = find_date_picker_source(form_data, form_id)
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
-      # Use form_data as-is (already built correctly by build_minimal_form_data)
-      # Just add our date values and AJAX control parameters
+      log "Date picker source: #{date_picker}"
+
       form_data = form_data.dup
       form_data["#{form_id}:sheetDate"] = date_str
-      form_data["#{form_id}:j_idt57_input"] = date_str
-      form_data["#{form_id}:showAllAreasOrTrainers"] = 'true'  # Show all courts!
+      form_data["#{date_picker}_input"] = date_str
+      form_data["#{form_id}:showAllAreasOrTrainers"] = 'true'
 
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
