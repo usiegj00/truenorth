@@ -1040,7 +1040,14 @@ module Truenorth
     end
 
     def select_slot_ajax(form_id, view_state, slot, components, form_fields)
-      source_id = components['showReservationScreen'] || "#{form_id}:j_idt146"
+      source_id = components['showReservationScreen']
+      unless source_id
+        # The showReservationScreen function is triggered when clicking a slot.
+        # Look for it in the page JavaScript or use a dynamic approach.
+        source_id = "#{form_id}:j_idt146"
+        log "select_slot: using fallback source_id #{source_id} (showReservationScreen not in components)"
+      end
+      log "select_slot source_id: #{source_id}"
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
@@ -1062,6 +1069,10 @@ module Truenorth
       response = post_ajax(ajax_url, form_data)
       if response.is_a?(Net::HTTPSuccess)
         new_components = extract_components_from_ajax(response.body)
+        log "select_slot response components: #{new_components.inspect}"
+        # Also try to find save button dynamically from the dialog HTML
+        new_components['saveButton'] ||= find_save_button_id(response.body)
+        log "select_slot save button: #{new_components['saveButton'] || 'NOT FOUND'}"
         { success: true, view_state: extract_view_state_from_ajax(response.body), components: new_components, body: response.body }
       else
         { success: false, error: "HTTP #{response.code}" }
@@ -1069,7 +1080,8 @@ module Truenorth
     end
 
     def save_booking_ajax(form_id, view_state, slot, components, dialog_fields)
-      save_button_id = components['saveButton'] || "#{form_id}:j_idt378"
+      save_button_id = components['saveButton'] || find_save_button_id_from_dialog(dialog_fields) || "#{form_id}:j_idt378"
+      log "save_booking using button: #{save_button_id}"
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
@@ -1112,6 +1124,36 @@ module Truenorth
       else
         { success: false, error: "HTTP #{response.code}" }
       end
+    end
+
+    # Find the save button ID dynamically from the AJAX response body
+    def find_save_button_id(response_body)
+      return nil unless response_body
+
+      # Try multiple patterns for the save button
+      # Pattern 1: btn-save class
+      if (match = response_body.match(/id="([^"]+)"[^>]*class="[^"]*btn-save/))
+        return match[1]
+      end
+
+      # Pattern 2: commandLink with "Save" or "Book" text
+      doc = Nokogiri::HTML(response_body)
+      save_link = doc.css('a.ui-commandlink, button.ui-button').find do |el|
+        text = el.text.strip
+        text =~ /\b(Save|Book|Confirm)\b/i
+      end
+      return save_link['id'] if save_link&.[]('id')
+
+      # Pattern 3: Look for PrimeFaces.ab calls referencing save
+      if (match = response_body.match(/rc_(?:save|book)\w*\s*=\s*function\(\)\s*\{PrimeFaces\.ab\(\{s:"([^"]+)"/))
+        return match[1]
+      end
+
+      nil
+    end
+
+    def find_save_button_id_from_dialog(_dialog_fields)
+      nil # Dialog fields don't contain the button ID
     end
 
     def extract_components_from_ajax(response_body)
