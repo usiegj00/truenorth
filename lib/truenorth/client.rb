@@ -739,12 +739,18 @@ module Truenorth
     end
 
     def change_date(html, date_str, activity_id = nil)
-      # Extract what we can from the HTML
       form_id = extract_form_id(html)
       view_state = extract_view_state(html)
 
-      # Build minimal form data manually to avoid extraction issues
-      form_data = build_minimal_form_data(html, form_id, activity_id)
+      # Use full form fields (not just hidden) so dynamic ID detection works
+      form_data = extract_all_form_fields(html, form_id)
+      if form_data.empty?
+        form_data = build_minimal_form_data(html, form_id, activity_id)
+      elsif activity_id && form_id
+        form_data["#{form_id}:activityId"] = activity_id.to_s
+        activity_source = find_activity_source(form_data, form_id)
+        form_data["#{activity_source}_input"] = activity_id.to_s
+      end
 
       result = change_date_ajax(form_id, view_state, date_str, form_data)
       return html unless result[:success]
