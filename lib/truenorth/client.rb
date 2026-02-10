@@ -565,7 +565,22 @@ module Truenorth
     def find_slot(html, target_time, preferred_court = nil)
       target_normalized = normalize_time(target_time)
 
-      html.css('td.slot.open div[data-start-time]').each do |div|
+      all_slots = html.css('td.slot.open div[data-start-time]')
+      log "find_slot: looking for '#{target_normalized}', found #{all_slots.length} open slot divs"
+      if all_slots.length.zero?
+        # Try without 'open' class to see what's there
+        any_slots = html.css('td.slot div[data-start-time]')
+        log "find_slot: #{any_slots.length} total slot divs (including non-open)"
+        if any_slots.length.positive?
+          sample_td = any_slots.first.parent
+          sample_td = sample_td.parent while sample_td && sample_td.name != 'td'
+          log "find_slot: sample td classes: '#{sample_td&.[]('class')}'"
+          times = any_slots.first(3).map { |d| d['data-start-time'] }
+          log "find_slot: sample times: #{times.join(', ')}"
+        end
+      end
+
+      all_slots.each do |div|
         slot_time = normalize_time(div['data-start-time'])
         next unless slot_time == target_normalized
 
@@ -1114,7 +1129,9 @@ module Truenorth
       return nil unless body
 
       cdata_content = body.scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
-      return nil if cdata_content.empty? || !cdata_content.include?('slot')
+      has_slot = cdata_content.include?('slot')
+      log "parse_ajax_cdata: #{cdata_content.length} bytes, has slot: #{has_slot}"
+      return nil if cdata_content.empty? || !has_slot
 
       Nokogiri::HTML(cdata_content)
     end
