@@ -1052,15 +1052,19 @@ module Truenorth
       encoded_url = URI.encode_www_form_component(ajax_url)
 
       form_data = form_fields.dup
+      # Set the activityAreaId form field to the slot's area
+      form_data["#{form_id}:activityAreaId"] = slot[:area_id]
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
         'javax.faces.source' => source_id,
-        'javax.faces.partial.execute' => '@all',
+        # PrimeFaces uses p: sourceId, meaning only the source component is processed
+        'javax.faces.partial.execute' => source_id,
         'javax.faces.partial.render' => form_id,
         source_id => source_id,
         form_id => form_id,
         'javax.faces.encodedURL' => encoded_url,
         'javax.faces.ViewState' => view_state,
+        # These are PrimeFaces pa (params) - sent as plain form data
         'activityAreaId' => slot[:area_id],
         'startTime' => slot[:start_time],
         'endTime' => slot[:end_time]
