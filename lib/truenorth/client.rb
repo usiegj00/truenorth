@@ -566,7 +566,8 @@ module Truenorth
       target_normalized = normalize_time(target_time)
 
       all_slots = html.css('td.slot.open div[data-start-time]')
-      log "find_slot: looking for '#{target_normalized}', found #{all_slots.length} open slot divs"
+      sample_times = all_slots.first(5).map { |d| d['data-start-time'] }
+      log "find_slot: looking for '#{target_normalized}', found #{all_slots.length} open slot divs, sample times: #{sample_times.join(', ')}"
       if all_slots.length.zero?
         # Try without 'open' class to see what's there
         any_slots = html.css('td.slot div[data-start-time]')
