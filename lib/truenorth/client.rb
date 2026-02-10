@@ -216,8 +216,21 @@ module Truenorth
 
       raise BookingError, 'Could not extract form state' unless view_state && form_id
 
-      # Change activity if needed
+      # Navigate to the requested date if needed
       activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
+      current_date = html.at_css('input[name*="sheetDate"]')&.[]('value')
+      requested_date = date.strftime('%m/%d/%Y')
+
+      if current_date != requested_date
+        log "Navigating from #{current_date} to #{requested_date}"
+        html = change_date(html, requested_date, activity_id)
+        view_state = extract_view_state(html) || view_state
+        form_id = extract_form_id(html) || form_id
+        components = extract_primefaces_components(html)
+        form_fields = extract_all_form_fields(html, form_id)
+      end
+
+      # Change activity if needed
       current_activity = form_fields["#{form_id}:activityId"]
 
       if current_activity != activity_id
