@@ -141,52 +141,8 @@ module Truenorth
         html = change_activity(html, activity_id)
       end
 
-      # Debug: Save HTML after activity change
-      if @debug
-        debug_file = "/tmp/truenorth_after_activity_#{Time.now.to_i}.html"
-        File.write(debug_file, html.to_s)
-        log "Saved HTML after activity change to: #{debug_file}"
-      end
-
-      # Court dropdown not available in HTML response - use hardcoded IDs
-      court_ids = COURT_IDS_BY_ACTIVITY[activity.to_s.downcase] || []
-
-      if court_ids.length >= 3
-        log "Querying #{court_ids.length} courts individually (IDs: #{court_ids.join(', ')})"
-        all_slots = {}
-
-        court_ids.each do |court_id|
-          court_name = COURTS[court_id] || "Court #{court_id}"
-          log "Querying #{court_name} (ID: #{court_id})"
-
-          # Set activityAreaId and refresh
-          form_id = extract_form_id(html)
-          view_state = extract_view_state(html)
-          form_fields = extract_all_form_fields(html, form_id)
-          form_fields["#{form_id}:activityAreaId"] = court_id
-
-          # Make AJAX request to update table for this court
-          result = change_date_ajax(form_id, view_state, requested_date, form_fields)
-          if result[:success]
-            court_html = Nokogiri::HTML(result[:body].scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n"))
-            court_slots = parse_slots(court_html)
-
-            # Merge slots
-            court_slots.each do |time, courts|
-              all_slots[time] ||= []
-              all_slots[time].concat(courts)
-              all_slots[time].uniq!
-            end
-          end
-        end
-
-        slots = all_slots
-        log "Combined #{slots.count} time slots from all courts"
-      else
-        # Fallback to original parsing
-        slots = parse_slots(html)
-        log "Found #{slots.count} available time slots"
-      end
+      slots = parse_slots(html)
+      log "Found #{slots.count} available time slots"
 
       {
         success: true,
