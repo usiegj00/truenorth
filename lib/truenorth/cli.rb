@@ -2,6 +2,7 @@
 
 require 'thor'
 require 'date'
+require 'chronic'
 require 'tty-table'
 require 'io/console'
 require_relative '../truenorth'
@@ -114,15 +115,16 @@ module Truenorth
           say "Confirmation: #{result[:confirmation]}" if result[:confirmation]
         end
       end
-    rescue Error => e
+    rescue BookingError => e
       say "Error: #{e.message}", :red
 
-      # If no slot available, show nearby available times using HTTP client
-      if e.message.include?('No slot available')
-        http_client = Client.new(debug: options[:debug])
-        show_nearby_availability(http_client, date, time, activity)
-      end
+      # Show nearby available times using HTTP client
+      http_client = Client.new(debug: options[:debug])
+      show_nearby_availability(http_client, date, time, activity)
 
+      exit 1
+    rescue Error => e
+      say "Error: #{e.message}", :red
       exit 1
     end
 
@@ -410,53 +412,20 @@ module Truenorth
         input = input.gsub(/\b(squash|golf|music|room)\b/i, '').strip
       end
 
-      # Extract date if present
-      date = nil
-      input_lower = input.downcase
+      # Normalize shorthand am/pm ("4:45p" -> "4:45pm", "10a" -> "10am")
+      input = input.gsub(/(\d)\s*([ap])\b(?!m)/i) { "#{::Regexp.last_match(1)}#{::Regexp.last_match(2)}m" }
 
-      # Try patterns like "feb 15", "february 15th", "2/15"
-      if input_lower =~ /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(st|nd|rd|th)?\b/i
-        month_str = ::Regexp.last_match(1)
-        day = ::Regexp.last_match(2).to_i
+      # Use Chronic for natural language date/time parsing
+      parsed_time = Chronic.parse(input, context: :future)
 
-        month_map = {
-          'jan' => 1, 'feb' => 2, 'mar' => 3, 'apr' => 4,
-          'may' => 5, 'jun' => 6, 'jul' => 7, 'aug' => 8,
-          'sep' => 9, 'oct' => 10, 'nov' => 11, 'dec' => 12
-        }
-
-        month = month_map[month_str[0..2].downcase]
-        year = Date.today.year
-        year += 1 if month && month < Date.today.month # Next year if month has passed
-
-        date = Date.new(year, month, day) if month
-        input = input.gsub(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(st|nd|rd|th)?\b/i, '').strip
-      elsif input =~ %r{\b(\d{1,2})/(\d{1,2})\b}
-        month = ::Regexp.last_match(1).to_i
-        day = ::Regexp.last_match(2).to_i
-        year = Date.today.year
-        date = Date.new(year, month, day)
-        input = input.gsub(%r{\b\d{1,2}/\d{1,2}\b}, '').strip
+      if parsed_time
+        date = parsed_time.to_date
+        time = parsed_time.strftime('%-l:%M %p')
+      else
+        # Fallback: use date option and treat input as time
+        date = parse_date(date_option)
+        time = input.strip
       end
-
-      # Remove day names (monday, tuesday, etc.)
-      input = input.gsub(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i, '').strip
-
-      # Extract time - look for patterns like "10am", "10:00am", "10:00 AM", "10"
-      time = nil
-      if input =~ /\b(\d{1,2})(:(\d{2}))?\s*(am|pm)?\b/i
-        hour = ::Regexp.last_match(1).to_i
-        minute = ::Regexp.last_match(3) || '00'
-        period = ::Regexp.last_match(4) || (hour < 8 ? 'PM' : 'AM')
-
-        time = "#{hour}:#{minute} #{period.upcase}"
-      end
-
-      # Use provided date option if date wasn't extracted
-      date ||= parse_date(date_option)
-
-      # If no time found, use the remaining input as-is
-      time ||= input.strip
 
       { date: date, time: time, activity: activity }
     end
@@ -464,13 +433,14 @@ module Truenorth
     def parse_date(date_str)
       return Date.today if date_str.nil? || date_str.empty?
 
-      case date_str
-      when /^\+(\d+)$/
-        Date.today + ::Regexp.last_match(1).to_i
-      when 'today'
-        Date.today
-      when 'tomorrow'
-        Date.today + 1
+      # Handle +N shorthand for days from today
+      if date_str =~ /^\+(\d+)$/
+        return Date.today + ::Regexp.last_match(1).to_i
+      end
+
+      parsed = Chronic.parse(date_str, context: :future)
+      if parsed
+        parsed.to_date
       else
         Date.parse(date_str)
       end
