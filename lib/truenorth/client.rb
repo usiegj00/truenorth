@@ -226,13 +226,22 @@ module Truenorth
         log "Found slot: #{slot[:court]} at #{slot[:start_time]}"
       end
 
-      # Select slot via AJAX
+      # Select slot via AJAX (opens reservation dialog, starts hold timer)
       select_result = select_slot_ajax(form_id, view_state, slot, components, form_fields)
       raise BookingError, 'Failed to select slot' unless select_result[:success]
 
       new_view_state = select_result[:view_state] || view_state
       new_components = select_result[:components] || components
+
+      # Extract ALL form fields from the select response (includes clientId, dialog fields)
       dialog_fields = extract_fields_from_ajax_response(select_result[:body], form_id) if select_result[:body]
+
+      # Verify hold timer started (confirms server accepted the slot selection)
+      if select_result[:body]&.include?('startHoldTimeTimer')
+        log 'Slot hold timer started - slot reserved temporarily'
+      else
+        log 'WARNING: No hold timer detected in select response'
+      end
 
       if dry_run
         return {
@@ -1084,16 +1093,16 @@ module Truenorth
     end
 
     def save_booking_ajax(form_id, view_state, slot, components, dialog_fields)
-      save_button_id = components['saveButton'] || find_save_button_id_from_dialog(dialog_fields) || "#{form_id}:j_idt378"
+      save_button_id = components['saveButton']
+      unless save_button_id
+        log 'WARNING: Save button not found in components, cannot save booking'
+        return { success: false, error: 'Save button not found - slot selection may have failed' }
+      end
       log "save_booking using button: #{save_button_id}"
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
       form_data = (dialog_fields || {}).dup
-      form_data["#{form_id}:selectedSlotId"] = slot[:id]
-      form_data["#{form_id}:selectedAreaId"] = slot[:area_id]
-      form_data["#{form_id}:selectedStartTime"] = slot[:start_time]
-      form_data["#{form_id}:selectedEndTime"] = slot[:end_time]
       form_data.merge!(
         'javax.faces.partial.ajax' => 'true',
         'javax.faces.source' => save_button_id,
@@ -1108,63 +1117,82 @@ module Truenorth
       response = post_ajax(ajax_url, form_data)
       if response.is_a?(Net::HTTPSuccess)
         body = response.body
-
-        # Check for specific error messages (not generic words that appear in HTML classes)
-        # PrimeFaces shows errors via ui-messages-error or growl severity:"error"
-        if body.include?('ui-messages-error') || body =~ /severity["']?\s*:\s*["']?error/i
-          error_html = Nokogiri::HTML(body)
-          error_text = error_html.at_css('.ui-messages-error-detail, .ui-growl-message')&.text&.strip
-          log "Booking save returned error: #{error_text || 'unknown'}"
-          { success: false, error: error_text || 'Booking save failed' }
-        elsif body.include?('exception') && body.include?('stacktrace')
-          log 'Booking save returned server exception'
-          { success: false, error: 'Server error during booking' }
-        else
-          # HTTP 200 with a standard AJAX response = success
-          # The save button click either succeeds or shows a PrimeFaces error message
-          log "Booking save appears successful (HTTP 200, #{body.length} bytes)"
-          { success: true, confirmation: 'Booking confirmed' }
-        end
+        parse_save_response(body)
       else
         { success: false, error: "HTTP #{response.code}" }
       end
     end
 
-    # Find the save button ID dynamically from the AJAX response body
+    def parse_save_response(body)
+      # Check for advance booking restriction overlay
+      if body =~ /advance/i && body =~ /not allowed|only be made/i
+        restriction = body.match(/Advance reservation[^.]*\./i)&.[](0) ||
+                      body.match(/Reservations can only be made[^.]*\./i)&.[](0)
+        log "Booking rejected: #{restriction || 'advance booking restriction'}"
+        return { success: false, error: restriction || 'Advance booking restriction' }
+      end
+
+      # Check for PrimeFaces error messages (ui-messages-error or growl)
+      if body.include?('ui-messages-error') || body =~ /severity["']?\s*:\s*["']?error/i
+        error_html = Nokogiri::HTML(body)
+        error_text = error_html.at_css('.ui-messages-error-detail, .ui-growl-message')&.text&.strip
+        log "Booking save returned error: #{error_text || 'unknown'}"
+        return { success: false, error: error_text || 'Booking save failed' }
+      end
+
+      # Check for server exception
+      if body.include?('exception') && body.include?('stacktrace')
+        log 'Booking save returned server exception'
+        return { success: false, error: 'Server error during booking' }
+      end
+
+      # Check for restriction/warning overlays
+      if body =~ /not allowed|cannot be booked|restriction|already reserved/i
+        msg = body.match(/((?:not allowed|cannot be booked|restriction|already reserved)[^.<]*)/i)&.[](0)
+        log "Booking rejected: #{msg}"
+        return { success: false, error: msg || 'Booking not allowed' }
+      end
+
+      # HTTP 200 with no error indicators = success
+      log "Booking save appears successful (HTTP 200, #{body.length} bytes)"
+      { success: true, confirmation: 'Booking confirmed' }
+    end
+
+    # Find the save button ID dynamically from the AJAX response body.
+    # Parses CDATA sections with Nokogiri for reliable detection.
     def find_save_button_id(response_body)
       return nil unless response_body
 
-      # Try multiple patterns for the save button
-      # Pattern 1: btn-save class
-      if (match = response_body.match(/id="([^"]+)"[^>]*class="[^"]*btn-save/))
+      # Parse each CDATA update section with Nokogiri
+      response_body.scan(/<update[^>]*>\s*<!\[CDATA\[(.*?)\]\]>/m) do |match|
+        frag = Nokogiri::HTML::DocumentFragment.parse(match[0])
+
+        # Look for btn-save class on buttons or links
+        save_el = frag.at_css('.btn-save[id]') ||
+                  frag.at_css('button[id]') { |el| el.text.strip =~ /\bSave\b/i } ||
+                  frag.at_css('a[id]') { |el| el.text.strip =~ /\bSave\b/i }
+        return save_el['id'] if save_el&.[]('id')
+      end
+
+      # Fallback: regex for btn-save (handles either class-before-id or id-before-class)
+      if (match = response_body.match(/class="[^"]*btn-save[^"]*"[^>]*id="([^"]+)"/))
         return match[1]
       end
-
-      # Pattern 2: commandLink with "Save" or "Book" text
-      doc = Nokogiri::HTML(response_body)
-      save_link = doc.css('a.ui-commandlink, button.ui-button').find do |el|
-        text = el.text.strip
-        text =~ /\b(Save|Book|Confirm)\b/i
-      end
-      return save_link['id'] if save_link&.[]('id')
-
-      # Pattern 3: Look for PrimeFaces.ab calls referencing save
-      if (match = response_body.match(/rc_(?:save|book)\w*\s*=\s*function\(\)\s*\{PrimeFaces\.ab\(\{s:"([^"]+)"/))
+      if (match = response_body.match(/id="([^"]+)"[^>]*class="[^"]*btn-save/))
         return match[1]
       end
 
       nil
     end
 
-    def find_save_button_id_from_dialog(_dialog_fields)
-      nil # Dialog fields don't contain the button ID
-    end
-
     def extract_components_from_ajax(response_body)
       components = {}
-      if (save_match = response_body.match(/id="([^"]+)"[^>]*class="[^"]*btn-save/))
-        components['saveButton'] = save_match[1]
-      end
+
+      # Find save button via Nokogiri CDATA parsing
+      save_id = find_save_button_id(response_body)
+      components['saveButton'] = save_id if save_id
+
+      # Extract rc_ PrimeFaces remote command functions
       response_body.scan(/rc_(\w+)\s*=\s*function\(\)\s*\{PrimeFaces\.ab\(\{s:"([^"]+)"/) do |match|
         components[match[0]] = match[1]
       end
