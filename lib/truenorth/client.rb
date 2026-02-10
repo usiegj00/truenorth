@@ -56,6 +56,7 @@ module Truenorth
       @debug = debug
       @debug_log = StringIO.new
       @logged_in = !@cookies.empty?  # If we have cookies, will verify on first use
+      @login_time = nil
       @last_verified_response = nil
 
       log "Loaded #{@cookies.length} cookies from cache" if @logged_in && @debug
@@ -103,6 +104,7 @@ module Truenorth
 
       if response.body.include?('Sign Out') || response.body.include?('My Reservations')
         @logged_in = true
+        @login_time = Time.now
         Config.save_cookies(@cookies)
         log 'Login successful (cookies saved)'
         true
@@ -123,23 +125,14 @@ module Truenorth
       response = get(BOOKING_PATH)
       html = Nokogiri::HTML(response.body)
 
-      # Navigate to the requested date first if needed
-      current_date = html.at_css('input[name*="sheetDate"]')&.[]('value')
       requested_date = date.strftime('%m/%d/%Y')
       activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
 
-      if current_date != requested_date
-        log "Navigating from #{current_date} to #{requested_date}"
-        html = change_date(html, requested_date, activity_id)
-      end
-
-      # Then change activity type - this should now return slots for the correct date
-      current_activity = html.at_css('input[name*="activityId"]')&.[]('value')
-
-      if current_activity && current_activity != activity_id
-        log "Changing activity from #{current_activity} to #{activity_id}"
-        html = change_activity(html, activity_id)
-      end
+      # Always navigate to the correct date + activity in one AJAX call.
+      # change_date includes the activity_id in form data via build_minimal_form_data,
+      # so the server returns slots for the requested activity on the requested date.
+      log "Navigating to #{requested_date} with activity #{activity_id}"
+      html = change_date(html, requested_date, activity_id)
 
       slots = parse_slots(html)
       log "Found #{slots.count} available time slots"
@@ -172,32 +165,17 @@ module Truenorth
 
       raise BookingError, 'Could not extract form state' unless view_state && form_id
 
-      # Navigate to the requested date if needed
+      # Always navigate to the correct date + activity in one AJAX call.
+      # change_date includes activity_id in form data via build_minimal_form_data.
       activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
-      current_date = html.at_css('input[name*="sheetDate"]')&.[]('value')
       requested_date = date.strftime('%m/%d/%Y')
 
-      if current_date != requested_date
-        log "Navigating from #{current_date} to #{requested_date}"
-        html = change_date(html, requested_date, activity_id)
-        view_state = extract_view_state(html) || view_state
-        form_id = extract_form_id(html) || form_id
-        components = extract_primefaces_components(html)
-        form_fields = extract_all_form_fields(html, form_id)
-      end
-
-      # Change activity if needed
-      current_activity = form_fields["#{form_id}:activityId"]
-
-      if current_activity != activity_id
-        log "Changing activity from #{current_activity} to #{activity_id}"
-        result = change_activity_ajax(form_id, view_state, activity_id, form_fields, components)
-        raise BookingError, 'Failed to change activity type' unless result[:success]
-
-        view_state = result[:view_state] || view_state
-        html = Nokogiri::HTML(result[:body]) if result[:body]
-        form_fields = extract_all_form_fields(html, form_id)
-      end
+      log "Navigating to #{requested_date} with activity #{activity_id}"
+      html = change_date(html, requested_date, activity_id)
+      view_state = extract_view_state(html) || view_state
+      form_id = extract_form_id(html) || form_id
+      components = extract_primefaces_components(html)
+      form_fields = extract_all_form_fields(html, form_id)
 
       # Find the slot (or use provided slot_info)
       if slot_info
@@ -449,11 +427,17 @@ module Truenorth
     private
 
     def ensure_logged_in!
+      # Skip verification if we logged in recently (within 5 minutes)
+      if @logged_in && @login_time && (Time.now - @login_time < 300)
+        return
+      end
+
       if @logged_in
         # Verify cached session is still valid with a lightweight check
         response = get(RESERVATIONS_PATH)
         if authenticated_response?(response)
           @last_verified_response = response
+          @login_time = Time.now  # Reset timer on successful verification
           return
         end
 
@@ -857,7 +841,7 @@ module Truenorth
     end
 
     def change_activity_ajax(form_id, view_state, activity_id, form_fields, _components)
-      activity_dropdown = "#{form_id}:j_idt57"
+      activity_dropdown = "#{form_id}:j_idt51"
       ajax_url = build_ajax_url
       encoded_url = URI.encode_www_form_component(ajax_url)
 
@@ -1027,22 +1011,22 @@ module Truenorth
       response = post_ajax(ajax_url, form_data)
       if response.is_a?(Net::HTTPSuccess)
         body = response.body
-        body_lower = body.downcase
 
-        # Check for explicit error indicators
-        if body_lower.include?('error') || body_lower.include?('failed') ||
-           body_lower.include?('unable') || body_lower.include?('invalid')
-          log "Booking save returned error indicators in response"
-          { success: false, error: 'Booking save failed' }
-        # Check for success indicators OR assume success if reasonable response
-        elsif body_lower.include?('success') || body_lower.include?('confirmed') ||
-              body_lower.include?('booked') || body_lower.include?('reserved') ||
-              (body.length < 5000 && !body_lower.include?('exception'))
-          log "Booking save appears successful (HTTP 200)"
-          { success: true, confirmation: 'Booking confirmed' }
+        # Check for specific error messages (not generic words that appear in HTML classes)
+        # PrimeFaces shows errors via ui-messages-error or growl severity:"error"
+        if body.include?('ui-messages-error') || body =~ /severity["']?\s*:\s*["']?error/i
+          error_html = Nokogiri::HTML(body)
+          error_text = error_html.at_css('.ui-messages-error-detail, .ui-growl-message')&.text&.strip
+          log "Booking save returned error: #{error_text || 'unknown'}"
+          { success: false, error: error_text || 'Booking save failed' }
+        elsif body.include?('exception') && body.include?('stacktrace')
+          log 'Booking save returned server exception'
+          { success: false, error: 'Server error during booking' }
         else
-          log "Uncertain booking result, response length: #{body.length}"
-          { success: false, error: 'No confirmation in response' }
+          # HTTP 200 with a standard AJAX response = success
+          # The save button click either succeeds or shows a PrimeFaces error message
+          log "Booking save appears successful (HTTP 200, #{body.length} bytes)"
+          { success: true, confirmation: 'Booking confirmed' }
         end
       else
         { success: false, error: "HTTP #{response.code}" }
