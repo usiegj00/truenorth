@@ -128,11 +128,32 @@ module Truenorth
       requested_date = date.strftime('%m/%d/%Y')
       activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
 
-      # Always navigate to the correct date + activity in one AJAX call.
-      # change_date includes the activity_id in form data via build_minimal_form_data,
-      # so the server returns slots for the requested activity on the requested date.
-      log "Navigating to #{requested_date} with activity #{activity_id}"
+      # Preserve full-page form state before AJAX navigation
+      form_id = extract_form_id(html)
+      view_state = extract_view_state(html)
+      components = extract_primefaces_components(html)
+      form_fields = extract_all_form_fields(html, form_id)
+
+      # Step 1: Navigate to the correct date
+      log "Navigating to #{requested_date}"
       html = change_date(html, requested_date, activity_id)
+      view_state = extract_view_state(html) || view_state
+
+      # Step 2: Change activity type
+      # The dateSelect event only changes the date; a separate change event
+      # is needed to switch the activity (e.g., from golf to squash).
+      log "Changing activity to #{activity_id} (#{activity})"
+      updated_fields = extract_all_form_fields(html, form_id)
+      updated_fields = form_fields.dup if updated_fields.empty?
+      updated_fields["#{form_id}:activityId"] = activity_id
+      updated_fields["#{form_id}:j_idt51_input"] = activity_id
+      updated_fields["#{form_id}:sheetDate"] = requested_date
+
+      result = change_activity_ajax(form_id, view_state, activity_id, updated_fields, components)
+      if result[:success]
+        view_state = result[:view_state] || view_state
+        html = parse_ajax_cdata(result[:body]) || html
+      end
 
       slots = parse_slots(html)
       log "Found #{slots.count} available time slots"
@@ -165,17 +186,30 @@ module Truenorth
 
       raise BookingError, 'Could not extract form state' unless view_state && form_id
 
-      # Always navigate to the correct date + activity in one AJAX call.
-      # change_date includes activity_id in form data via build_minimal_form_data.
       activity_id = ACTIVITIES[activity.to_s.downcase] || '5'
       requested_date = date.strftime('%m/%d/%Y')
 
-      log "Navigating to #{requested_date} with activity #{activity_id}"
+      # Step 1: Navigate to the correct date
+      log "Navigating to #{requested_date}"
       html = change_date(html, requested_date, activity_id)
       view_state = extract_view_state(html) || view_state
-      form_id = extract_form_id(html) || form_id
-      components = extract_primefaces_components(html)
-      form_fields = extract_all_form_fields(html, form_id)
+
+      # Step 2: Change activity type (dateSelect only changes date, not activity)
+      log "Changing activity to #{activity_id} (#{activity})"
+      updated_fields = extract_all_form_fields(html, form_id)
+      updated_fields = form_fields.dup if updated_fields.empty?
+      updated_fields["#{form_id}:activityId"] = activity_id
+      updated_fields["#{form_id}:j_idt51_input"] = activity_id
+      updated_fields["#{form_id}:sheetDate"] = requested_date
+
+      result = change_activity_ajax(form_id, view_state, activity_id, updated_fields, components)
+      if result[:success]
+        view_state = result[:view_state] || view_state
+        html = parse_ajax_cdata(result[:body]) || html
+        components = extract_components_from_ajax(result[:body]) if result[:body]
+        form_fields = extract_all_form_fields(html, form_id)
+        form_fields = updated_fields if form_fields.empty?
+      end
 
       # Find the slot (or use provided slot_info)
       if slot_info
@@ -1042,6 +1076,16 @@ module Truenorth
         components[match[0]] = match[1]
       end
       components
+    end
+
+    # Parse CDATA content from a PrimeFaces AJAX response
+    def parse_ajax_cdata(body)
+      return nil unless body
+
+      cdata_content = body.scan(/<!\[CDATA\[(.*?)\]\]>/m).flatten.join("\n")
+      return nil if cdata_content.empty? || !cdata_content.include?('slot')
+
+      Nokogiri::HTML(cdata_content)
     end
 
     def extract_view_state_from_ajax(response_body)
