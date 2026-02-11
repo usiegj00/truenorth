@@ -139,6 +139,12 @@ module Truenorth
       say 'Fetching reservations...', :cyan
       results = client.reservations
 
+      # Retry once if results are empty (transient session issues)
+      if results.empty?
+        client = Client.new(debug: options[:debug])
+        results = client.reservations
+      end
+
       if options[:json]
         puts JSON.pretty_generate(results)
       else

@@ -127,30 +127,34 @@ module Truenorth
 
       log "Clicked slot: #{slot_info[:court]} at #{slot_info[:time]}"
 
-      # Check if reservation panel appeared with Save button
-      panel_state = @browser.evaluate(<<~JS)
-        (function() {
-          var panel = document.querySelector('[id*="reservationPanel"]');
-          var saveBtn = document.querySelector('.btn-save');
-          var fromTime = document.querySelector('select[name*="fromTime_input"]');
-          return {
-            hasPanel: !!panel,
-            panelVisible: panel ? panel.offsetWidth > 0 : false,
-            hasSaveBtn: !!saveBtn,
-            saveBtnVisible: saveBtn ? saveBtn.offsetWidth > 0 : false,
-            saveBtnId: saveBtn ? saveBtn.id : null,
-            fromTime: fromTime ? fromTime.value : null
-          };
-        })()
-      JS
-      log "Reservation panel: #{panel_state.inspect}"
+      # Wait for reservation panel to appear with Save button (poll up to 10 seconds)
+      panel_state = nil
+      10.times do |i|
+        sleep 1
+        panel_state = @browser.evaluate(<<~JS)
+          (function() {
+            var panel = document.querySelector('[id*="reservationPanel"]');
+            var saveBtn = document.querySelector('.btn-save');
+            var fromTime = document.querySelector('select[name*="fromTime_input"]');
+            return {
+              hasPanel: !!panel,
+              panelVisible: panel ? panel.offsetWidth > 0 : false,
+              hasSaveBtn: !!saveBtn,
+              saveBtnVisible: saveBtn ? saveBtn.offsetWidth > 0 : false,
+              saveBtnId: saveBtn ? saveBtn.id : null,
+              fromTime: fromTime ? fromTime.value : null
+            };
+          })()
+        JS
+        log "Panel check #{i + 1}/10: #{panel_state.inspect}"
+
+        break if panel_state['saveBtnVisible']
+      end
 
       unless panel_state['saveBtnVisible']
-        log 'Save button not visible after slot click'
-        if @debug
-          @browser.screenshot(path: '/tmp/no_save_btn.png', full: true)
-          log 'Saved screenshot to /tmp/no_save_btn.png'
-        end
+        log 'Save button not visible after 10s of waiting'
+        @browser.screenshot(path: '/tmp/no_save_btn.png', full: true)
+        log 'Saved screenshot to /tmp/no_save_btn.png'
         raise BookingError, 'Reservation panel did not appear after clicking slot'
       end
 
